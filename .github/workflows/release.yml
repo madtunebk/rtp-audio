@@ -1,4 +1,5 @@
-# Builds rtp-audio for Linux and Windows and attaches the archives to a GitHub release.
+# Builds rtp-audio for Linux (x86_64, ARM64), Windows and macOS (receiver) and attaches the
+# archives to a GitHub release.
 # Runs when a release is published; "Run workflow" on the Actions tab makes a test build
 # (downloadable from the run's page, nothing is attached).
 name: Release
@@ -21,9 +22,17 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             binary: rtp-audio
+          # Raspberry Pi 4/5 (64-bit OS), ARM cloud servers.
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: rtp-audio
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary: rtp-audio.exe
+          # Apple Silicon Macs: the receiver (capturing is Linux only).
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: rtp-audio
     runs-on: ${{ matrix.os }}
     env:
       VERSION: ${{ github.event.release.tag_name || format('dev-{0}', github.sha) }}
@@ -36,7 +45,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libpulse-dev libasound2-dev pkg-config
+          sudo apt-get install -y --no-install-recommends libpulse-dev libasound2-dev pkg-config cmake
 
       - name: Test
         run: cargo test --locked
@@ -49,7 +58,7 @@ jobs:
         run: |
           name="rtp-audio-${VERSION}-${{ matrix.target }}"
           mkdir "$name"
-          cp "target/release/${{ matrix.binary }}" README.md "$name/"
+          cp -r "target/release/${{ matrix.binary }}" README.md docs "$name/"
           if [ "$RUNNER_OS" = Windows ]; then
             archive="$name.zip"
             7z a -bd "$archive" "$name" > /dev/null
@@ -57,7 +66,7 @@ jobs:
             archive="$name.tar.gz"
             tar czf "$archive" "$name"
           fi
-          sha256sum "$archive" > "$archive.sha256"
+          if command -v sha256sum > /dev/null; then sha256sum "$archive"; else shasum -a 256 "$archive"; fi > "$archive.sha256"
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - name: Attach to the release
