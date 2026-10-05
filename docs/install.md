@@ -6,6 +6,9 @@ NGINX with HTTPS, and OauthRS for the login. Afterwards the noVNC page has two m
 its control bar: 🔊 to hear the desktop, and 🎙️ to send your microphone to it. Both go through
 the same HTTPS connection and login, so this works on a VPS too, with no extra ports.
 
+No OauthRS, only a VNC password? Then let NGINX ask for a password instead: see
+[without OauthRS](#without-oauthrs-a-password-in-nginx) in step 3.
+
 Run everything as the desktop's user, logged in over SSH as that user (not through `su` or
 `sudo -u`). The examples use the user `nobus`, with user ID 1000 (`id -u` shows yours).
 
@@ -90,6 +93,63 @@ Above `location = /websockify {`, add the audio location, protected by the same 
 ```bash
 sudo nginx -t
 sudo systemctl reload nginx
+```
+
+### Without OauthRS: a password in NGINX
+
+If your noVNC is behind NGINX with only a VNC password, add a login in NGINX first. The VNC
+password does not protect the sound: only the VNC server checks it, and the audio server has no
+login of its own. One NGINX password for the whole site protects the desktop, its sound and the
+microphone, and the browser asks for it once.
+
+```bash
+sudo apt install -y apache2-utils
+sudo htpasswd -c /etc/nginx/desktop.htpasswd nobus
+```
+
+In your site's `server { … }` block (the HTTPS one), add:
+
+```nginx
+    # A password for the whole site: the desktop, its sound and the microphone.
+    auth_basic "Remote desktop";
+    auth_basic_user_file /etc/nginx/desktop.htpasswd;
+```
+
+Add the `sub_filter` lines to `location /` as above, and this audio location, without the
+`auth_request` line, since the password above already covers it:
+
+```nginx
+    # rtp-audio: the desktop's sound and your microphone.
+    location /audio/ {
+        proxy_pass http://127.0.0.1:46080/;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        # Keep the password out of the audio server.
+        proxy_set_header Authorization "";
+
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+```
+
+`$connection_upgrade` needs a `map` in the `http` context; if your configuration doesn't have
+one yet, add it at the top of the site file, outside `server { … }`:
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+```
+
+Test and reload as above. Without the password, `/audio/player.js` now answers `401`:
+
+```bash
+curl -k -s -o /dev/null -w '%{http_code}\n' https://localhost/audio/player.js
 ```
 
 ## 4. Run it as a service
