@@ -1,0 +1,16 @@
+[package]
+name = "rtp-audio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.18.2"
+socket2 = "0.6"
+
+[profile.release]
+strip = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+libpulse-binding = "2.30"
+signal-hook = "0.4"

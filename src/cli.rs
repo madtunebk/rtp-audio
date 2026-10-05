@@ -1,0 +1,215 @@
+//! Command line parsing and validation.
+
+use std::net::{SocketAddr, ToSocketAddrs};
+
+use crate::receive;
+
+pub const USAGE: &str = "\
+usage:
+  rtp-audio [receive] [--port 46000] [--latency 60] [--rate 48000] [--channels 2]
+      play RTP audio (16-bit PCM) arriving on a UDP port; --latency is the buffer in ms
+  rtp-audio sources
+      list this computer's sound sources (Linux)
+  rtp-audio send HOST:PORT
+      send all of this computer's sound (Linux): adds an \"RTP Audio\" output, makes it the
+      default and moves playing apps to it; Ctrl+C switches everything back
+  rtp-audio send HOST:PORT --source NAME_OR_ID
+      send one source from `rtp-audio sources` instead, without changing any output
+  rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]
+      send raw big-endian 16-bit PCM read from stdin
+
+HOST is the receiving computer, e.g. rtp-audio send 192.168.1.20:46000";
+
+pub enum Command {
+    Help,
+    Receive(receive::Options),
+    Sources,
+    Send(SendOptions),
+}
+
+pub struct SendOptions {
+    pub destination: SocketAddr,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub source: Option<String>,
+    pub stdin: bool,
+    pub rate: u32,
+    pub channels: usize,
+}
+
+pub fn parse(args: Vec<String>) -> Result<Command, String> {
+    let mut command: Option<String> = None;
+    let mut positional = Vec::new();
+    let (mut port, mut latency_ms, mut rate, mut channels) = (None, None, None, None);
+    let (mut source, mut stdin) = (None, false);
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or(format!("{arg} needs a value"));
+        match arg.as_str() {
+            "-h" | "--help" | "help" => return Ok(Command::Help),
+            "--port" => port = Some(number::<u16>(&arg, &value()?)?),
+            "--latency" => latency_ms = Some(number::<u32>(&arg, &value()?)?),
+            "--rate" => rate = Some(number::<u32>(&arg, &value()?)?),
+            "--channels" => channels = Some(number::<usize>(&arg, &value()?)?),
+            "-s" | "--source" => source = Some(value()?),
+            "--stdin" => stdin = true,
+            _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'\n\n{USAGE}")),
+            "receive" | "send" | "sources" if command.is_none() => command = Some(arg),
+            _ => positional.push(arg),
+        }
+    }
+    if channels.is_some_and(|c| !(1..=2).contains(&c)) {
+        return Err("--channels must be 1 or 2".into());
+    }
+    let only = |allowed: &[&str]| -> Result<(), String> {
+        let given = [
+            ("--port", port.is_some()),
+            ("--latency", latency_ms.is_some()),
+            ("--rate", rate.is_some()),
+            ("--channels", channels.is_some()),
+            ("--source", source.is_some()),
+            ("--stdin", stdin),
+        ];
+        match given.iter().find(|(name, set)| *set && !allowed.contains(name)) {
+            Some((name, _)) => Err(format!("{name} can't be used here\n\n{USAGE}")),
+            None => Ok(()),
+        }
+    };
+    let extra = |what: &str| format!("unexpected argument '{what}'\n\n{USAGE}");
+
+    match command.as_deref() {
+        Some("sources") => {
+            only(&[])?;
+            match positional.first() {
+                Some(arg) => Err(extra(arg)),
+                None => Ok(Command::Sources),
+            }
+        }
+        Some("send") => {
+            let mut positional = positional.into_iter();
+            let destination = positional
+                .next()
+                .ok_or(format!("send needs the receiver's address, e.g. rtp-audio send 192.168.1.20:46000\n\n{USAGE}"))?;
+            if let Some(arg) = positional.next() {
+                return Err(extra(&arg));
+            }
+            if stdin {
+                only(&["--stdin", "--rate", "--channels"])?;
+            } else {
+                only(&["--source"])?;
+            }
+            if source.as_deref().is_some_and(|s| s.trim().is_empty()) {
+                return Err("--source needs a source name or ID (see rtp-audio sources)".into());
+            }
+            Ok(Command::Send(SendOptions {
+                destination: parse_destination(&destination)?,
+                source,
+                stdin,
+                rate: nonzero("--rate", rate.unwrap_or(48_000))?,
+                channels: channels.unwrap_or(2),
+            }))
+        }
+        _ => {
+            only(&["--port", "--latency", "--rate", "--channels"])?;
+            if let Some(arg) = positional.first() {
+                return Err(extra(arg));
+            }
+            Ok(Command::Receive(receive::Options {
+                port: nonzero("--port", port.unwrap_or(46000))?,
+                latency_ms: nonzero("--latency", latency_ms.unwrap_or(60))?,
+                rate: nonzero("--rate", rate.unwrap_or(48_000))?,
+                channels: channels.unwrap_or(2),
+            }))
+        }
+    }
+}
+
+fn number<T: std::str::FromStr>(option: &str, text: &str) -> Result<T, String> {
+    text.parse().map_err(|_| format!("{option}: '{text}' is not a valid number"))
+}
+
+fn nonzero<T: Default + PartialEq>(option: &str, value: T) -> Result<T, String> {
+    if value == T::default() { Err(format!("{option} must be above 0")) } else { Ok(value) }
+}
+
+/// `HOST:PORT`, `IP:PORT` or `[IPv6]:PORT`, resolved to an address.
+pub fn parse_destination(text: &str) -> Result<SocketAddr, String> {
+    let example = "e.g. 192.168.1.20:46000";
+    let (host, port) = text
+        .rsplit_once(':')
+        .ok_or(format!("destination '{text}' has no port; use HOST:PORT, {example}"))?;
+    let host = match host.strip_prefix('[') {
+        Some(rest) => rest.strip_suffix(']').ok_or(format!("destination '{text}': unclosed '['"))?,
+        None if host.contains(':') => {
+            return Err(format!("destination '{text}': write IPv6 addresses in brackets, e.g. [fd00::2]:46000"));
+        }
+        None => host,
+    };
+    if host.is_empty() {
+        return Err(format!("destination '{text}' has no host; use HOST:PORT, {example}"));
+    }
+    let port = port
+        .parse::<u16>()
+        .ok()
+        .filter(|&port| port != 0)
+        .ok_or(format!("destination '{text}': '{port}' is not a valid port (1-65535)"))?;
+    let addresses: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| format!("cannot resolve '{host}': {err}"))?
+        .collect();
+    // Prefer IPv4: it's what LANs and most VPNs use.
+    addresses
+        .iter()
+        .find(|address| address.is_ipv4())
+        .or(addresses.first())
+        .copied()
+        .ok_or(format!("cannot resolve '{host}': no addresses"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, parse, parse_destination};
+
+    fn args(line: &str) -> Vec<String> {
+        line.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn destinations() {
+        assert_eq!(parse_destination("192.168.1.20:46000").unwrap().to_string(), "192.168.1.20:46000");
+        assert_eq!(parse_destination("[::1]:46000").unwrap().to_string(), "[::1]:46000");
+        assert_eq!(parse_destination("localhost:5").unwrap().port(), 5);
+        for bad in ["192.168.1.20", "192.168.1.20:0", "192.168.1.20:70000", "192.168.1.20:x", ":46000", "::1:46000"] {
+            assert!(parse_destination(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn commands() {
+        assert!(matches!(parse(args("")), Ok(Command::Receive(o)) if o.port == 46000));
+        assert!(matches!(parse(args("--port 5000")), Ok(Command::Receive(o)) if o.port == 5000));
+        assert!(matches!(parse(args("sources")), Ok(Command::Sources)));
+        assert!(matches!(parse(args("send 10.0.0.2:46000 --help")), Ok(Command::Help)));
+        let Ok(Command::Send(send)) = parse(args("send 10.0.0.2:46000 --source 48")) else { panic!() };
+        assert_eq!((send.source.as_deref(), send.stdin), (Some("48"), false));
+        assert!(matches!(parse(args("send 10.0.0.2:46000 --stdin --rate 44100")), Ok(Command::Send(s)) if s.rate == 44100));
+    }
+
+    #[test]
+    fn rejects_bad_arguments() {
+        for bad in [
+            "send",
+            "send 10.0.0.2",
+            "send 10.0.0.2:46000 extra",
+            "send 10.0.0.2:46000 --rate 44100",
+            "send 10.0.0.2:46000 --stdin --source 1",
+            "send 10.0.0.2:46000 --source",
+            "sources --port 1",
+            "--port 0",
+            "--port 99999",
+            "--channels 3",
+            "--frobnicate",
+        ] {
+            assert!(parse(args(bad)).is_err(), "{bad}");
+        }
+    }
+}
