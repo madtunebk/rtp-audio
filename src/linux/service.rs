@@ -88,7 +88,10 @@ fn install(send_args: &[String]) -> Result<(), Box<dyn Error>> {
     std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     eprintln!("Wrote {}", path.display());
     systemctl(&["daemon-reload"])?;
-    systemctl(&["enable", "--now", UNIT])?;
+    systemctl(&["enable", UNIT])?;
+    // Restart, not just start: installing again (e.g. after an upgrade, or with other options)
+    // must run the new binary and options, not leave the old process running.
+    systemctl(&["restart", UNIT])?;
     eprintln!("rtp-audio now runs as a service: `rtp-audio service status` shows how it is doing.");
     eprintln!("It runs {exe}: keep that file where it is, or install again after moving it.");
     if !lingers() {

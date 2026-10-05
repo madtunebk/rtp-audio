@@ -91,7 +91,10 @@
     } else {
       el = document.createElement("button");
       el.type = "button";
+      // Ignore the page's own button styles (noVNC's would stretch these into ovals).
+      el.style.all = "initial";
       Object.assign(el.style, {
+        boxSizing: "border-box", padding: "0", margin: "0", lineHeight: "46px", textAlign: "center", fontFamily: "sans-serif",
         position: "fixed", right: "16px", bottom: `${16 + 64 * floating++}px`, zIndex: 2147483647, width: "48px",
         height: "48px", borderRadius: "50%", border: "1px solid rgba(255,255,255,.25)", background: "rgba(20,24,32,.85)",
         color: "#fff", fontSize: "22px", cursor: "pointer", boxShadow: "0 4px 16px rgba(0,0,0,.4)",
