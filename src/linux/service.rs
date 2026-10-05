@@ -64,6 +64,8 @@ fn install(send_args: &[String]) -> Result<(), Box<dyn Error>> {
     let path = unit_path()?;
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(&path, unit_file(exe, send_args)).map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+    // It may hold a --key: readable only by you.
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     eprintln!("Wrote {}", path.display());
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", "--now", UNIT])?;

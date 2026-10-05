@@ -3,6 +3,8 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::receive;
+use crate::secure::Key;
+use crate::transport::Encoding;
 
 pub const USAGE: &str = "\
 usage:
@@ -11,6 +13,10 @@ usage:
       --device an output from `rtp-audio devices`, --volume in percent
   rtp-audio devices
       list the sound outputs the receiver can play on
+  rtp-audio keygen
+      make a key for --key: then sender and receiver need the same key, e.g.
+      rtp-audio send 192.168.1.20:46000 --opus --key-file ~/.rtp-audio.key
+      rtp-audio --key-file rtp-audio.key
   rtp-audio sources
       list this computer's sound sources (Linux)
   rtp-audio send HOST:PORT
@@ -18,6 +24,9 @@ usage:
       default and moves playing apps to it; Ctrl+C switches everything back
   rtp-audio send HOST:PORT --source NAME_OR_ID
       send one source from `rtp-audio sources` instead, without changing any output
+  rtp-audio send HOST:PORT [--opus] [--key KEY | --key-file FILE]
+      --opus: about 128 kbit/s instead of 1.5 Mbit/s (needs an rtp-audio receiver);
+      --key/--key-file: encrypt (the receiver needs the same key)
   rtp-audio send --web 127.0.0.1:46080 [HOST:PORT] [--source NAME_OR_ID]
       (also) serve the sound to web browsers, as Opus over a WebSocket, with a player page;
       put it behind NGINX for HTTPS and a login (see docs/web.md)
@@ -37,11 +46,13 @@ pub enum Command {
     Receive(receive::Options),
     Sources,
     Devices,
+    Keygen,
     Send(SendOptions),
 }
 
 pub struct SendOptions {
     pub destination: Option<SocketAddr>,
+    pub encoding: Encoding,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub web: Option<SocketAddr>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -60,6 +71,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
     let (mut port, mut latency_ms, mut rate, mut channels) = (None, None, None, None);
     let (mut source, mut stdin, mut web) = (None, false, None);
     let (mut device, mut volume) = (None, None);
+    let (mut opus, mut key, mut key_file) = (false, None, None);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
@@ -73,9 +85,12 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             "--stdin" => stdin = true,
             "--web" => web = Some(value()?),
             "--device" => device = Some(value()?),
+            "--opus" => opus = true,
+            "--key" => key = Some(value()?),
+            "--key-file" => key_file = Some(value()?),
             "--volume" => volume = Some(number::<f32>(&arg, &value()?)?),
             _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'\n\n{USAGE}")),
-            "receive" | "send" | "sources" | "devices" if command.is_none() => command = Some(arg),
+            "receive" | "send" | "sources" | "devices" | "keygen" if command.is_none() => command = Some(arg),
             _ => positional.push(arg),
         }
     }
@@ -93,6 +108,9 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             ("--web", web.is_some()),
             ("--device", device.is_some()),
             ("--volume", volume.is_some()),
+            ("--opus", opus),
+            ("--key", key.is_some()),
+            ("--key-file", key_file.is_some()),
         ];
         match given.iter().find(|(name, set)| *set && !allowed.contains(name)) {
             Some((name, _)) => Err(format!("{name} can't be used here\n\n{USAGE}")),
@@ -107,6 +125,13 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             match positional.first() {
                 Some(arg) => Err(extra(arg)),
                 None => Ok(Command::Sources),
+            }
+        }
+        Some("keygen") => {
+            only(&[])?;
+            match positional.first() {
+                Some(arg) => Err(extra(arg)),
+                None => Ok(Command::Keygen),
             }
         }
         Some("devices") => {
@@ -128,18 +153,24 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 ));
             }
             if stdin {
-                only(&["--stdin", "--rate", "--channels"])?;
+                only(&["--stdin", "--rate", "--channels", "--opus", "--key", "--key-file"])?;
                 if destination.is_none() {
                     return Err("--stdin needs the receiver's address".into());
                 }
             } else {
-                only(&["--source", "--web"])?;
+                only(&["--source", "--web", "--opus", "--key", "--key-file"])?;
+            }
+            if destination.is_none() && (opus || key.is_some() || key_file.is_some()) {
+                return Err("--opus and --key are for the UDP stream to a receiver; the browser mode is \
+                    already Opus, and NGINX's HTTPS protects it"
+                    .into());
             }
             if source.as_deref().is_some_and(|s| s.trim().is_empty()) {
                 return Err("--source needs a source name or ID (see rtp-audio sources)".into());
             }
             Ok(Command::Send(SendOptions {
                 destination: destination.as_deref().map(parse_destination).transpose()?,
+                encoding: Encoding { opus, key: read_key(key, key_file)? },
                 web: web.as_deref().map(parse_web).transpose()?,
                 source,
                 stdin,
@@ -148,7 +179,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         _ => {
-            only(&["--port", "--latency", "--rate", "--channels", "--device", "--volume"])?;
+            only(&["--port", "--latency", "--rate", "--channels", "--device", "--volume", "--key", "--key-file"])?;
             let volume = volume.unwrap_or(100.0);
             if !(0.0..=400.0).contains(&volume) {
                 return Err("--volume must be between 0 and 400 (percent)".into());
@@ -163,6 +194,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 channels: channels.unwrap_or(2),
                 device,
                 volume: volume / 100.0,
+                key: read_key(key, key_file)?,
             }))
         }
     }
@@ -192,6 +224,15 @@ fn number<T: std::str::FromStr>(option: &str, text: &str) -> Result<T, String> {
 
 fn nonzero<T: Default + PartialEq>(option: &str, value: T) -> Result<T, String> {
     if value == T::default() { Err(format!("{option} must be above 0")) } else { Ok(value) }
+}
+
+fn read_key(key: Option<String>, key_file: Option<String>) -> Result<Option<Key>, String> {
+    match (key, key_file) {
+        (Some(_), Some(_)) => Err("use --key or --key-file, not both".into()),
+        (Some(key), None) => Key::parse(&key).map(Some),
+        (None, Some(path)) => Key::from_file(&path).map(Some),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Where to serve browsers: `IP:PORT`, or just `PORT` for 127.0.0.1.
@@ -269,6 +310,11 @@ mod tests {
         assert!(matches!(parse(args("service install --web 46080")), Ok(Command::Service { action, send_args }) if action == "install" && send_args.len() == 2));
         assert!(matches!(parse(args("service status")), Ok(Command::Service { .. })));
         assert!(matches!(parse(args("devices")), Ok(Command::Devices)));
+        assert!(matches!(parse(args("keygen")), Ok(Command::Keygen)));
+        let key = crate::secure::generate().unwrap();
+        let Ok(Command::Send(send)) = parse(args(&format!("send 10.0.0.2:46000 --opus --key {key}"))) else { panic!() };
+        assert!(send.encoding.opus && send.encoding.key.is_some());
+        assert!(matches!(parse(args(&format!("--key {key}"))), Ok(Command::Receive(o)) if o.key.is_some()));
         assert!(matches!(parse(args("--device Speakers --volume 50")), Ok(Command::Receive(o)) if o.volume == 0.5 && o.device.as_deref() == Some("Speakers")));
         assert!(matches!(parse(args("send 10.0.0.2:46000 --stdin --rate 44100")), Ok(Command::Send(s)) if s.rate == 44100));
     }
@@ -295,6 +341,11 @@ mod tests {
             "--volume -1",
             "devices --port 1",
             "send 10.0.0.2:46000 --volume 50",
+            "send --web 46080 --opus",
+            "send 10.0.0.2:46000 --key short",
+            "send 10.0.0.2:46000 --key-file /nonexistent",
+            "keygen extra",
+            "--opus",
             "sources --port 1",
             "--port 0",
             "--port 99999",

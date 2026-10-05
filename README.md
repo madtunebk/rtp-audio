@@ -10,8 +10,9 @@ Hear a remote Linux desktop's sound on your own computer, over the network. One 
   🔊 button on the noVNC page. Nothing to install where you listen, and it travels inside HTTPS
   and behind the login. See [sound in the browser](docs/web.md).
 
-> The UDP stream is **unencrypted**: noVNC and NGINX's HTTPS don't cover it. Use it on a LAN or
-> through a private VPN, or use the browser mode instead.
+> The UDP stream is **unencrypted by default**: noVNC and NGINX's HTTPS don't cover it. Use it on
+> a LAN or through a private VPN, encrypt it with `--key-file` (see [setup](docs/setup.md#smaller-and-encrypted)),
+> or use the browser mode instead.
 
 ## Quick start
 

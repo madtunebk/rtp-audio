@@ -63,6 +63,26 @@ To send a single source (a microphone, or a copy of a real output) without chang
 A "Monitor of ..." source is a copy of what that output plays, and it keeps playing on the
 desktop too. IDs can change when the sound server restarts; names don't.
 
+## Smaller and encrypted
+
+By default the sound travels as plain 16-bit audio, about 1.5 Mbit/s, which any RTP L16
+receiver can play. Between two rtp-audio programs you can do better:
+
+```bash
+./rtp-audio keygen > ~/.rtp-audio.key && chmod 600 ~/.rtp-audio.key   # once; copy the file to the other computer
+./rtp-audio send 192.168.1.20:46000 --opus --key-file ~/.rtp-audio.key   # sender
+rtp-audio --key-file rtp-audio.key                                       # receiver
+```
+
+- `--opus` compresses the sound to about 150 kbit/s with no audible difference: fine over Wi-Fi,
+  a VPN or a phone hotspot. A lost packet is filled in by Opus instead of becoming silence.
+- `--key-file` (or `--key KEY`) encrypts and authenticates every packet with ChaCha20-Poly1305.
+  Nobody without the key can listen, change the sound or replay it. A receiver with a key
+  ignores anything not encrypted with it, and tells you why if the keys don't match.
+- Prefer `--key-file`: a `--key` on the command line is visible to other users in `ps`.
+
+The receiver recognises plain, Opus and encrypted sound by itself; only `--key` must be given.
+
 ## Run it automatically
 
 Instead of starting the sender by hand in an SSH session, install it as a user service. It
@@ -86,8 +106,9 @@ install command tells you when that's needed. No other part of rtp-audio runs ex
 ```
 rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME_OR_ID] [--volume 100]
 rtp-audio devices                                                 # outputs for --device
+rtp-audio keygen                                                  # a key for --key / --key-file
 rtp-audio sources
-rtp-audio send HOST:PORT [--source NAME_OR_ID]
+rtp-audio send HOST:PORT [--source NAME_OR_ID] [--opus] [--key-file FILE]
 rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]   # raw s16be PCM from stdin
 rtp-audio send --web 46080 [HOST:PORT]                           # sound in the browser, see web.md
 rtp-audio service install SEND_OPTIONS | uninstall | status | start | stop | restart

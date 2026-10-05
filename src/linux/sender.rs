@@ -12,7 +12,7 @@ use super::capture::{self, Capture};
 use super::pulse::Pulse;
 use super::routing::{self, DISPLAY_NAME, Routing};
 use super::{Event, fail_point, lock};
-use crate::transport::{AudioSink, RtpSender};
+use crate::transport::{AudioSink, Encoding, RtpSender};
 use crate::web;
 
 /// Ctrl+C (or SIGTERM) arrived before streaming started.
@@ -28,15 +28,20 @@ impl fmt::Display for Interrupted {
 impl Error for Interrupted {}
 
 /// Send to a receiver at `destination`, to browsers through a server on `web`, or both.
-pub fn run(destination: Option<SocketAddr>, source: Option<&str>, web: Option<SocketAddr>) -> Result<(), Box<dyn Error>> {
+pub fn run(
+    destination: Option<SocketAddr>,
+    encoding: Encoding,
+    source: Option<&str>,
+    web: Option<SocketAddr>,
+) -> Result<(), Box<dyn Error>> {
     // Fail on a bad network or a busy port before touching any sound settings.
     let mut sinks: Vec<Box<dyn AudioSink>> = Vec::new();
     let mut targets = Vec::new();
     if let Some(destination) = destination {
-        let rtp = RtpSender::connect(destination, capture::RATE, capture::CHANNELS.into())
+        let rtp = RtpSender::connect(destination, capture::RATE, capture::CHANNELS.into(), encoding)
             .map_err(|err| format!("cannot send to {destination}: {err}"))?;
+        targets.push(format!("{destination} ({})", rtp.describe()));
         sinks.push(Box::new(rtp));
-        targets.push(destination.to_string());
     }
     if let Some(address) = web {
         sinks.push(Box::new(web::start(address)?));
