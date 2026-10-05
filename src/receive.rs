@@ -10,6 +10,7 @@ use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
+use crate::discover;
 use crate::jitter::{Jitter, Player, Stats};
 use crate::rtp;
 use crate::secure::{self, Key, ReplayWindow};
@@ -25,6 +26,10 @@ pub struct Options {
     pub volume: f32,
     /// Only accept packets encrypted with this key.
     pub key: Option<Key>,
+    /// Also listen to this multicast group.
+    pub group: Option<Ipv4Addr>,
+    /// Answer `rtp-audio find`.
+    pub discovery: bool,
 }
 
 /// Turns arriving packets (L16, Opus, or encrypted) into big-endian PCM for the jitter buffer.
@@ -198,7 +203,7 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     }?;
     stream.play()?;
 
-    let socket = bind(options.port)?;
+    let socket = bind(options.port, options.group)?;
     println!(
         "Listening on UDP port {} ({} Hz, {} ch, {} ms buffer); sound card: {} ({} Hz, {} ch, {format})",
         options.port, options.rate, options.channels, options.latency_ms, device_name(&device), config.sample_rate, config.channels
@@ -217,6 +222,9 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     if options.key.is_some() {
         println!("Only accepting sound encrypted with the key.");
     }
+    if let Some(group) = options.group {
+        println!("Also listening to multicast group {group}.");
+    }
     let mut last_report = Instant::now();
     let mut reported = Stats::default();
     let (mut last_status, mut packets, mut shown) = (Instant::now(), 0u32, Stats::default());
@@ -224,7 +232,12 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     loop {
         match socket.recv_from(&mut buf) {
             Ok((len, from)) => {
-                let Some(packet) = rtp::parse(&buf[..len]) else { continue };
+                let Some(packet) = rtp::parse(&buf[..len]) else {
+                    if options.discovery && discover::is_question(&buf[..len]) {
+                        let _ = socket.send_to(&discover::answer(options.port, options.key.is_some()), from);
+                    }
+                    continue;
+                };
                 let encrypted = packet.payload_type == secure::PAYLOAD_TYPE;
                 let frames = unpacker.unpack(&buf[..len], &packet);
                 if frames.is_empty() {
@@ -321,12 +334,19 @@ fn report(before: &Stats, now: &Stats) {
 
 /// A UDP socket with a big receive buffer: Windows' default is small enough that a short
 /// hiccup in this thread overflows it and loses packets.
-fn bind(port: u16) -> std::io::Result<UdpSocket> {
+fn bind(port: u16, group: Option<Ipv4Addr>) -> std::io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     if let Err(err) = socket.set_recv_buffer_size(1 << 20) {
         eprintln!("could not enlarge the receive buffer: {err}");
     }
+    if group.is_some() {
+        // Several receivers on one computer can listen to the same group.
+        socket.set_reuse_address(true)?;
+    }
     socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
+    if let Some(group) = group {
+        socket.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)?;
+    }
     Ok(socket.into())
 }
 

@@ -2,6 +2,7 @@
 //! and on Linux, send this machine's sound. See `cli::USAGE`.
 
 mod cli;
+mod discover;
 mod jitter;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -44,16 +45,24 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             );
             Ok(())
         }
-        Command::Send(options) if options.stdin => {
-            let destination = options.destination.ok_or("--stdin needs the receiver's address")?;
-            transport::send_stdin(destination, options.rate, options.channels, options.encoding)
+        Command::Find(port) => discover::print_found(port),
+        Command::Send(mut options) if options.stdin => {
+            if let Some(port) = options.auto {
+                options.destinations.push(discover::pick(port)?);
+            }
+            transport::send_stdin(options.destinations[0], options.rate, options.channels, options.encoding)
         }
         #[cfg(target_os = "linux")]
         Command::Sources => linux::list_sources(),
         #[cfg(target_os = "linux")]
         Command::Service { action, send_args } => linux::service::run(&action, &send_args),
         #[cfg(target_os = "linux")]
-        Command::Send(options) => linux::sender::run(options.destination, options.encoding, options.source.as_deref(), options.web, options.mic),
+        Command::Send(mut options) => {
+            if let Some(port) = options.auto {
+                options.destinations.push(discover::pick(port)?);
+            }
+            linux::sender::run(&options.destinations, options.encoding, options.source.as_deref(), options.web, options.mic)
+        }
         #[cfg(not(target_os = "linux"))]
         Command::Sources | Command::Send(_) | Command::Service { .. } => {
             Err("capturing sound is only supported on Linux; here, pipe raw audio into `send HOST:PORT --stdin`".into())

@@ -33,7 +33,7 @@ impl Error for Interrupted {}
 /// Send to a receiver at `destination`, to browsers through a server on `web`, or both. With
 /// `mic`, browsers can also send their microphone, which apps here hear as "RTP Audio Microphone".
 pub fn run(
-    destination: Option<SocketAddr>,
+    destinations: &[SocketAddr],
     encoding: Encoding,
     source: Option<&str>,
     web: Option<SocketAddr>,
@@ -43,8 +43,8 @@ pub fn run(
     // Fail on a bad network or a busy port before touching any sound settings.
     let mut sinks: Vec<Box<dyn AudioSink>> = Vec::new();
     let mut targets = Vec::new();
-    if let Some(destination) = destination {
-        let rtp = RtpSender::connect(destination, capture::RATE, capture::CHANNELS.into(), encoding)
+    for &destination in destinations {
+        let rtp = RtpSender::connect(destination, capture::RATE, capture::CHANNELS.into(), encoding.clone())
             .map_err(|err| format!("cannot send to {destination}: {err}"))?;
         targets.push(format!("{destination} ({})", rtp.describe()));
         sinks.push(Box::new(rtp));

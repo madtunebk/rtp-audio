@@ -56,6 +56,10 @@ impl RtpSender {
     pub fn connect(destination: SocketAddr, rate: u32, channels: usize, encoding: Encoding) -> Result<Self, Box<dyn Error>> {
         let local: SocketAddr = if destination.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().unwrap();
         let socket = UdpSocket::bind(local)?;
+        if destination.ip().is_multicast() {
+            // Stay on the local network.
+            socket.set_multicast_ttl_v4(1)?;
+        }
         socket.connect(destination)?;
         let encoder = if encoding.opus {
             if ![8_000, 12_000, 16_000, 24_000, 48_000].contains(&rate) {

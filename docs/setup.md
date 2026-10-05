@@ -83,6 +83,27 @@ rtp-audio --key-file rtp-audio.key                                       # recei
 
 The receiver recognises plain, Opus and encrypted sound by itself; only `--key` must be given.
 
+## Finding receivers, and several listeners
+
+On a local network you don't need to look up addresses:
+
+```bash
+./rtp-audio find                      # lists the receivers that are running: name, address
+./rtp-audio send auto                 # sends to the receiver `find` sees, if there's only one
+```
+
+Receivers answer `find` unless started with `--no-discovery`. Discovery uses a broadcast, so it
+stays on the local network: over a VPN, give the address.
+
+To send to several computers, list them, or use a multicast group that any number of receivers
+can join (the group stays on the local network):
+
+```bash
+./rtp-audio send 192.168.1.20:46000 192.168.1.30:46000     # two receivers
+./rtp-audio send 239.255.46.1:46000 --opus                  # a multicast group…
+rtp-audio --group 239.255.46.1                              # …on every receiver that wants it
+```
+
 ## Run it automatically
 
 Instead of starting the sender by hand in an SSH session, install it as a user service. It
@@ -105,10 +126,12 @@ install command tells you when that's needed. No other part of rtp-audio runs ex
 
 ```
 rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME_OR_ID] [--volume 100]
+                    [--key-file FILE] [--group 239.255.46.1] [--no-discovery]
+rtp-audio find [--port 46000]                                     # receivers on this network
 rtp-audio devices                                                 # outputs for --device
 rtp-audio keygen                                                  # a key for --key / --key-file
 rtp-audio sources
-rtp-audio send HOST:PORT [--source NAME_OR_ID] [--opus] [--key-file FILE]
+rtp-audio send HOST:PORT [HOST:PORT…] [--source NAME_OR_ID] [--opus] [--key-file FILE]   # or `auto`
 rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]   # raw s16be PCM from stdin
 rtp-audio send --web 46080 [--mic] [HOST:PORT]                   # sound (and microphone) in the browser, see web.md
 rtp-audio service install SEND_OPTIONS | uninstall | status | start | stop | restart

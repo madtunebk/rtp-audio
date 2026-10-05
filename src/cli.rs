@@ -9,19 +9,25 @@ use crate::transport::Encoding;
 pub const USAGE: &str = "\
 usage:
   rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME] [--volume 100]
+                     [--group 239.255.46.1] [--no-discovery]
       play RTP audio (16-bit PCM) arriving on a UDP port; --latency is the buffer in ms,
-      --device an output from `rtp-audio devices`, --volume in percent
+      --device an output from `rtp-audio devices`, --volume in percent, --group also
+      listens to a multicast group
   rtp-audio devices
       list the sound outputs the receiver can play on
+  rtp-audio find [--port 46000]
+      list the receivers on this local network (they answer unless --no-discovery)
   rtp-audio keygen
       make a key for --key: then sender and receiver need the same key, e.g.
       rtp-audio send 192.168.1.20:46000 --opus --key-file ~/.rtp-audio.key
       rtp-audio --key-file rtp-audio.key
   rtp-audio sources
       list this computer's sound sources (Linux)
-  rtp-audio send HOST:PORT
+  rtp-audio send HOST:PORT [HOST:PORT…]
       send all of this computer's sound (Linux): adds an \"RTP Audio\" output, makes it the
-      default and moves playing apps to it; Ctrl+C switches everything back
+      default and moves playing apps to it; Ctrl+C switches everything back. HOST:PORT can be
+      several receivers, a multicast group (e.g. 239.255.46.1:46000), or `auto`: the one
+      receiver `rtp-audio find` sees
   rtp-audio send HOST:PORT --source NAME_OR_ID
       send one source from `rtp-audio sources` instead, without changing any output
   rtp-audio send HOST:PORT [--opus] [--key KEY | --key-file FILE]
@@ -48,11 +54,14 @@ pub enum Command {
     Sources,
     Devices,
     Keygen,
+    Find(u16),
     Send(SendOptions),
 }
 
 pub struct SendOptions {
-    pub destination: Option<SocketAddr>,
+    pub destinations: Vec<SocketAddr>,
+    /// `auto`: use the receiver answering on this port.
+    pub auto: Option<u16>,
     pub encoding: Encoding,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub web: Option<SocketAddr>,
@@ -75,6 +84,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
     let (mut source, mut stdin, mut web) = (None, false, None);
     let (mut device, mut volume) = (None, None);
     let (mut opus, mut key, mut key_file, mut mic) = (false, None, None, false);
+    let (mut group, mut discovery) = (None, true);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
@@ -90,11 +100,13 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             "--device" => device = Some(value()?),
             "--opus" => opus = true,
             "--mic" => mic = true,
+            "--group" => group = Some(value()?),
+            "--no-discovery" => discovery = false,
             "--key" => key = Some(value()?),
             "--key-file" => key_file = Some(value()?),
             "--volume" => volume = Some(number::<f32>(&arg, &value()?)?),
             _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'\n\n{USAGE}")),
-            "receive" | "send" | "sources" | "devices" | "keygen" if command.is_none() => command = Some(arg),
+            "receive" | "send" | "sources" | "devices" | "keygen" | "find" if command.is_none() => command = Some(arg),
             _ => positional.push(arg),
         }
     }
@@ -116,6 +128,8 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             ("--key", key.is_some()),
             ("--key-file", key_file.is_some()),
             ("--mic", mic),
+            ("--group", group.is_some()),
+            ("--no-discovery", !discovery),
         ];
         match given.iter().find(|(name, set)| *set && !allowed.contains(name)) {
             Some((name, _)) => Err(format!("{name} can't be used here\n\n{USAGE}")),
@@ -130,6 +144,13 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             match positional.first() {
                 Some(arg) => Err(extra(arg)),
                 None => Ok(Command::Sources),
+            }
+        }
+        Some("find") => {
+            only(&["--port"])?;
+            match positional.first() {
+                Some(arg) => Err(extra(arg)),
+                None => Ok(Command::Find(nonzero("--port", port.unwrap_or(46000))?)),
             }
         }
         Some("keygen") => {
@@ -147,20 +168,26 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }
         }
         Some("send") => {
-            let mut positional = positional.into_iter();
-            let destination = positional.next();
-            if let Some(arg) = positional.next() {
-                return Err(extra(&arg));
+            let mut auto = None;
+            let mut destinations = Vec::new();
+            for arg in &positional {
+                if arg == "auto" || arg.starts_with("auto:") {
+                    let port = arg.strip_prefix("auto:").map_or(Ok(46000), |p| number::<u16>("auto", p))?;
+                    auto = Some(nonzero("auto port", port)?);
+                } else {
+                    destinations.push(parse_destination(arg)?);
+                }
             }
-            if destination.is_none() && web.is_none() {
+            let has_destination = !destinations.is_empty() || auto.is_some();
+            if !has_destination && web.is_none() {
                 return Err(format!(
                     "send needs the receiver's address (e.g. rtp-audio send 192.168.1.20:46000) or --web\n\n{USAGE}"
                 ));
             }
             if stdin {
                 only(&["--stdin", "--rate", "--channels", "--opus", "--key", "--key-file"])?;
-                if destination.is_none() {
-                    return Err("--stdin needs the receiver's address".into());
+                if destinations.len() + usize::from(auto.is_some()) != 1 {
+                    return Err("--stdin sends to exactly one receiver".into());
                 }
             } else {
                 only(&["--source", "--web", "--opus", "--key", "--key-file", "--mic"])?;
@@ -168,7 +195,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                     return Err("--mic takes the microphone from browsers: it needs --web".into());
                 }
             }
-            if destination.is_none() && (opus || key.is_some() || key_file.is_some()) {
+            if !has_destination && (opus || key.is_some() || key_file.is_some()) {
                 return Err("--opus and --key are for the UDP stream to a receiver; the browser mode is \
                     already Opus, and NGINX's HTTPS protects it"
                     .into());
@@ -177,7 +204,8 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 return Err("--source needs a source name or ID (see rtp-audio sources)".into());
             }
             Ok(Command::Send(SendOptions {
-                destination: destination.as_deref().map(parse_destination).transpose()?,
+                destinations,
+                auto,
                 encoding: Encoding { opus, key: read_key(key, key_file)? },
                 web: web.as_deref().map(parse_web).transpose()?,
                 mic,
@@ -188,7 +216,14 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         _ => {
-            only(&["--port", "--latency", "--rate", "--channels", "--device", "--volume", "--key", "--key-file"])?;
+            only(&["--port", "--latency", "--rate", "--channels", "--device", "--volume", "--key", "--key-file", "--group", "--no-discovery"])?;
+            let group = match group {
+                None => None,
+                Some(text) => match text.parse::<std::net::Ipv4Addr>() {
+                    Ok(ip) if ip.is_multicast() => Some(ip),
+                    _ => return Err(format!("--group: '{text}' is not a multicast address (224.0.0.0 to 239.255.255.255)")),
+                },
+            };
             let volume = volume.unwrap_or(100.0);
             if !(0.0..=400.0).contains(&volume) {
                 return Err("--volume must be between 0 and 400 (percent)".into());
@@ -204,6 +239,8 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 device,
                 volume: volume / 100.0,
                 key: read_key(key, key_file)?,
+                group,
+                discovery,
             }))
         }
     }
@@ -313,9 +350,13 @@ mod tests {
         let Ok(Command::Send(send)) = parse(args("send 10.0.0.2:46000 --source 48")) else { panic!() };
         assert_eq!((send.source.as_deref(), send.stdin), (Some("48"), false));
         let Ok(Command::Send(send)) = parse(args("send --web 46080")) else { panic!() };
-        assert_eq!((send.destination, send.web.map(|a| a.to_string())), (None, Some("127.0.0.1:46080".into())));
+        assert_eq!((send.destinations.len(), send.web.map(|a| a.to_string())), (0, Some("127.0.0.1:46080".into())));
         let Ok(Command::Send(send)) = parse(args("send 10.0.0.2:46000 --web 127.0.0.1:46080")) else { panic!() };
-        assert!(send.destination.is_some() && send.web.is_some());
+        assert!(send.destinations.len() == 1 && send.web.is_some());
+        let Ok(Command::Send(send)) = parse(args("send 10.0.0.2:46000 239.255.46.1:46000 auto:46002")) else { panic!() };
+        assert_eq!((send.destinations.len(), send.auto), (2, Some(46002)));
+        assert!(matches!(parse(args("find --port 46001")), Ok(Command::Find(46001))));
+        assert!(matches!(parse(args("--group 239.255.46.1 --no-discovery")), Ok(Command::Receive(o)) if o.group.is_some() && !o.discovery));
         assert!(matches!(parse(args("send --web 46080 --mic")), Ok(Command::Send(s)) if s.mic));
         assert!(matches!(parse(args("service install --web 46080")), Ok(Command::Service { action, send_args }) if action == "install" && send_args.len() == 2));
         assert!(matches!(parse(args("service status")), Ok(Command::Service { .. })));
@@ -352,6 +393,10 @@ mod tests {
             "devices --port 1",
             "send 10.0.0.2:46000 --volume 50",
             "send --web 46080 --opus",
+            "--group 10.0.0.1",
+            "send auto:0",
+            "send 10.0.0.2:46000 10.0.0.3:46000 --stdin",
+            "find --volume 3",
             "send 10.0.0.2:46000 --mic",
             "--mic",
             "send 10.0.0.2:46000 --key short",
