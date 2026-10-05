@@ -3,18 +3,44 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::receive;
+use crate::secure::Key;
+use crate::transport::Encoding;
 
 pub const USAGE: &str = "\
 usage:
-  rtp-audio [receive] [--port 46000] [--latency 60] [--rate 48000] [--channels 2]
-      play RTP audio (16-bit PCM) arriving on a UDP port; --latency is the buffer in ms
+  rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME] [--volume 100]
+                     [--group 239.255.46.1] [--no-discovery]
+      play RTP audio (16-bit PCM) arriving on a UDP port; --latency is the buffer in ms,
+      --device an output from `rtp-audio devices`, --volume in percent, --group also
+      listens to a multicast group
+  rtp-audio devices
+      list the sound outputs the receiver can play on
+  rtp-audio find [--port 46000]
+      list the receivers on this local network (they answer unless --no-discovery)
+  rtp-audio keygen
+      make a key for --key: then sender and receiver need the same key, e.g.
+      rtp-audio send 192.168.1.20:46000 --opus --key-file ~/.rtp-audio.key
+      rtp-audio --key-file rtp-audio.key
   rtp-audio sources
       list this computer's sound sources (Linux)
-  rtp-audio send HOST:PORT
+  rtp-audio send HOST:PORT [HOST:PORT…]
       send all of this computer's sound (Linux): adds an \"RTP Audio\" output, makes it the
-      default and moves playing apps to it; Ctrl+C switches everything back
+      default and moves playing apps to it; Ctrl+C switches everything back. HOST:PORT can be
+      several receivers, a multicast group (e.g. 239.255.46.1:46000), or `auto`: the one
+      receiver `rtp-audio find` sees
   rtp-audio send HOST:PORT --source NAME_OR_ID
       send one source from `rtp-audio sources` instead, without changing any output
+  rtp-audio send HOST:PORT [--opus] [--key KEY | --key-file FILE]
+      --opus: about 128 kbit/s instead of 1.5 Mbit/s (needs an rtp-audio receiver);
+      --key/--key-file: encrypt (the receiver needs the same key)
+  rtp-audio send --web 127.0.0.1:46080 [--mic] [HOST:PORT] [--source NAME_OR_ID]
+      (also) serve the sound to web browsers, as Opus over a WebSocket, with a player page;
+      put it behind NGINX for HTTPS and a login (see docs/web.md). --mic: browsers can also
+      send their microphone, which apps here hear as \"RTP Audio Microphone\"
+  rtp-audio service install SEND_OPTIONS
+      run `rtp-audio send SEND_OPTIONS` as a user service that starts with the desktop,
+      e.g. rtp-audio service install --web 46080
+  rtp-audio service uninstall | status | start | stop | restart
   rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]
       send raw big-endian 16-bit PCM read from stdin
 
@@ -22,13 +48,25 @@ HOST is the receiving computer, e.g. rtp-audio send 192.168.1.20:46000";
 
 pub enum Command {
     Help,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Service { action: String, send_args: Vec<String> },
     Receive(receive::Options),
     Sources,
+    Devices,
+    Keygen,
+    Find(u16),
     Send(SendOptions),
 }
 
 pub struct SendOptions {
-    pub destination: SocketAddr,
+    pub destinations: Vec<SocketAddr>,
+    /// `auto`: use the receiver answering on this port.
+    pub auto: Option<u16>,
+    pub encoding: Encoding,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub web: Option<SocketAddr>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub mic: bool,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub source: Option<String>,
     pub stdin: bool,
@@ -37,10 +75,16 @@ pub struct SendOptions {
 }
 
 pub fn parse(args: Vec<String>) -> Result<Command, String> {
+    if args.first().map(String::as_str) == Some("service") {
+        return parse_service(args);
+    }
     let mut command: Option<String> = None;
     let mut positional = Vec::new();
     let (mut port, mut latency_ms, mut rate, mut channels) = (None, None, None, None);
-    let (mut source, mut stdin) = (None, false);
+    let (mut source, mut stdin, mut web) = (None, false, None);
+    let (mut device, mut volume) = (None, None);
+    let (mut opus, mut key, mut key_file, mut mic) = (false, None, None, false);
+    let (mut group, mut discovery) = (None, true);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
@@ -52,8 +96,17 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             "--channels" => channels = Some(number::<usize>(&arg, &value()?)?),
             "-s" | "--source" => source = Some(value()?),
             "--stdin" => stdin = true,
+            "--web" => web = Some(value()?),
+            "--device" => device = Some(value()?),
+            "--opus" => opus = true,
+            "--mic" => mic = true,
+            "--group" => group = Some(value()?),
+            "--no-discovery" => discovery = false,
+            "--key" => key = Some(value()?),
+            "--key-file" => key_file = Some(value()?),
+            "--volume" => volume = Some(number::<f32>(&arg, &value()?)?),
             _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'\n\n{USAGE}")),
-            "receive" | "send" | "sources" if command.is_none() => command = Some(arg),
+            "receive" | "send" | "sources" | "devices" | "keygen" | "find" if command.is_none() => command = Some(arg),
             _ => positional.push(arg),
         }
     }
@@ -68,6 +121,15 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             ("--channels", channels.is_some()),
             ("--source", source.is_some()),
             ("--stdin", stdin),
+            ("--web", web.is_some()),
+            ("--device", device.is_some()),
+            ("--volume", volume.is_some()),
+            ("--opus", opus),
+            ("--key", key.is_some()),
+            ("--key-file", key_file.is_some()),
+            ("--mic", mic),
+            ("--group", group.is_some()),
+            ("--no-discovery", !discovery),
         ];
         match given.iter().find(|(name, set)| *set && !allowed.contains(name)) {
             Some((name, _)) => Err(format!("{name} can't be used here\n\n{USAGE}")),
@@ -84,24 +146,69 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 None => Ok(Command::Sources),
             }
         }
+        Some("find") => {
+            only(&["--port"])?;
+            match positional.first() {
+                Some(arg) => Err(extra(arg)),
+                None => Ok(Command::Find(nonzero("--port", port.unwrap_or(46000))?)),
+            }
+        }
+        Some("keygen") => {
+            only(&[])?;
+            match positional.first() {
+                Some(arg) => Err(extra(arg)),
+                None => Ok(Command::Keygen),
+            }
+        }
+        Some("devices") => {
+            only(&[])?;
+            match positional.first() {
+                Some(arg) => Err(extra(arg)),
+                None => Ok(Command::Devices),
+            }
+        }
         Some("send") => {
-            let mut positional = positional.into_iter();
-            let destination = positional
-                .next()
-                .ok_or(format!("send needs the receiver's address, e.g. rtp-audio send 192.168.1.20:46000\n\n{USAGE}"))?;
-            if let Some(arg) = positional.next() {
-                return Err(extra(&arg));
+            let mut auto = None;
+            let mut destinations = Vec::new();
+            for arg in &positional {
+                if arg == "auto" || arg.starts_with("auto:") {
+                    let port = arg.strip_prefix("auto:").map_or(Ok(46000), |p| number::<u16>("auto", p))?;
+                    auto = Some(nonzero("auto port", port)?);
+                } else {
+                    destinations.push(parse_destination(arg)?);
+                }
+            }
+            let has_destination = !destinations.is_empty() || auto.is_some();
+            if !has_destination && web.is_none() {
+                return Err(format!(
+                    "send needs the receiver's address (e.g. rtp-audio send 192.168.1.20:46000) or --web\n\n{USAGE}"
+                ));
             }
             if stdin {
-                only(&["--stdin", "--rate", "--channels"])?;
+                only(&["--stdin", "--rate", "--channels", "--opus", "--key", "--key-file"])?;
+                if destinations.len() + usize::from(auto.is_some()) != 1 {
+                    return Err("--stdin sends to exactly one receiver".into());
+                }
             } else {
-                only(&["--source"])?;
+                only(&["--source", "--web", "--opus", "--key", "--key-file", "--mic"])?;
+                if mic && web.is_none() {
+                    return Err("--mic takes the microphone from browsers: it needs --web".into());
+                }
+            }
+            if !has_destination && (opus || key.is_some() || key_file.is_some()) {
+                return Err("--opus and --key are for the UDP stream to a receiver; the browser mode is \
+                    already Opus, and NGINX's HTTPS protects it"
+                    .into());
             }
             if source.as_deref().is_some_and(|s| s.trim().is_empty()) {
                 return Err("--source needs a source name or ID (see rtp-audio sources)".into());
             }
             Ok(Command::Send(SendOptions {
-                destination: parse_destination(&destination)?,
+                destinations,
+                auto,
+                encoding: Encoding { opus, key: read_key(key, key_file)? },
+                web: web.as_deref().map(parse_web).transpose()?,
+                mic,
                 source,
                 stdin,
                 rate: nonzero("--rate", rate.unwrap_or(48_000))?,
@@ -109,7 +216,18 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         _ => {
-            only(&["--port", "--latency", "--rate", "--channels"])?;
+            only(&["--port", "--latency", "--rate", "--channels", "--device", "--volume", "--key", "--key-file", "--group", "--no-discovery"])?;
+            let group = match group {
+                None => None,
+                Some(text) => match text.parse::<std::net::Ipv4Addr>() {
+                    Ok(ip) if ip.is_multicast() => Some(ip),
+                    _ => return Err(format!("--group: '{text}' is not a multicast address (224.0.0.0 to 239.255.255.255)")),
+                },
+            };
+            let volume = volume.unwrap_or(100.0);
+            if !(0.0..=400.0).contains(&volume) {
+                return Err("--volume must be between 0 and 400 (percent)".into());
+            }
             if let Some(arg) = positional.first() {
                 return Err(extra(arg));
             }
@@ -118,8 +236,31 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 latency_ms: nonzero("--latency", latency_ms.unwrap_or(60))?,
                 rate: nonzero("--rate", rate.unwrap_or(48_000))?,
                 channels: channels.unwrap_or(2),
+                device,
+                volume: volume / 100.0,
+                key: read_key(key, key_file)?,
+                group,
+                discovery,
             }))
         }
+    }
+}
+
+/// `service ACTION [send options]`; install checks the options like `send` would.
+fn parse_service(args: Vec<String>) -> Result<Command, String> {
+    let mut args = args.into_iter().skip(1);
+    let action = args.next().ok_or(format!("service needs an action: install, uninstall, status, start, stop or restart\n\n{USAGE}"))?;
+    let send_args: Vec<String> = args.collect();
+    match action.as_str() {
+        "-h" | "--help" => Ok(Command::Help),
+        "install" => match parse(std::iter::once("send".to_string()).chain(send_args.iter().cloned()).collect())? {
+            Command::Send(options) if !options.stdin => Ok(Command::Service { action, send_args }),
+            Command::Send(_) => Err("the service can't read from --stdin".into()),
+            _ => Ok(Command::Help),
+        },
+        "uninstall" | "status" | "start" | "stop" | "restart" if send_args.is_empty() => Ok(Command::Service { action, send_args }),
+        "uninstall" | "status" | "start" | "stop" | "restart" => Err(format!("service {action} takes no options")),
+        _ => Err(format!("unknown service action '{action}'\n\n{USAGE}")),
     }
 }
 
@@ -129,6 +270,23 @@ fn number<T: std::str::FromStr>(option: &str, text: &str) -> Result<T, String> {
 
 fn nonzero<T: Default + PartialEq>(option: &str, value: T) -> Result<T, String> {
     if value == T::default() { Err(format!("{option} must be above 0")) } else { Ok(value) }
+}
+
+fn read_key(key: Option<String>, key_file: Option<String>) -> Result<Option<Key>, String> {
+    match (key, key_file) {
+        (Some(_), Some(_)) => Err("use --key or --key-file, not both".into()),
+        (Some(key), None) => Key::parse(&key).map(Some),
+        (None, Some(path)) => Key::from_file(&path).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Where to serve browsers: `IP:PORT`, or just `PORT` for 127.0.0.1.
+fn parse_web(text: &str) -> Result<SocketAddr, String> {
+    if let Ok(port) = text.parse::<u16>() {
+        return if port == 0 { Err("--web: port must be 1-65535".into()) } else { Ok(SocketAddr::from(([127, 0, 0, 1], port))) };
+    }
+    parse_destination(text).map_err(|err| format!("--web: {err}"))
 }
 
 /// `HOST:PORT`, `IP:PORT` or `[IPv6]:PORT`, resolved to an address.
@@ -191,6 +349,24 @@ mod tests {
         assert!(matches!(parse(args("send 10.0.0.2:46000 --help")), Ok(Command::Help)));
         let Ok(Command::Send(send)) = parse(args("send 10.0.0.2:46000 --source 48")) else { panic!() };
         assert_eq!((send.source.as_deref(), send.stdin), (Some("48"), false));
+        let Ok(Command::Send(send)) = parse(args("send --web 46080")) else { panic!() };
+        assert_eq!((send.destinations.len(), send.web.map(|a| a.to_string())), (0, Some("127.0.0.1:46080".into())));
+        let Ok(Command::Send(send)) = parse(args("send 10.0.0.2:46000 --web 127.0.0.1:46080")) else { panic!() };
+        assert!(send.destinations.len() == 1 && send.web.is_some());
+        let Ok(Command::Send(send)) = parse(args("send 10.0.0.2:46000 239.255.46.1:46000 auto:46002")) else { panic!() };
+        assert_eq!((send.destinations.len(), send.auto), (2, Some(46002)));
+        assert!(matches!(parse(args("find --port 46001")), Ok(Command::Find(46001))));
+        assert!(matches!(parse(args("--group 239.255.46.1 --no-discovery")), Ok(Command::Receive(o)) if o.group.is_some() && !o.discovery));
+        assert!(matches!(parse(args("send --web 46080 --mic")), Ok(Command::Send(s)) if s.mic));
+        assert!(matches!(parse(args("service install --web 46080")), Ok(Command::Service { action, send_args }) if action == "install" && send_args.len() == 2));
+        assert!(matches!(parse(args("service status")), Ok(Command::Service { .. })));
+        assert!(matches!(parse(args("devices")), Ok(Command::Devices)));
+        assert!(matches!(parse(args("keygen")), Ok(Command::Keygen)));
+        let key = crate::secure::generate().unwrap();
+        let Ok(Command::Send(send)) = parse(args(&format!("send 10.0.0.2:46000 --opus --key {key}"))) else { panic!() };
+        assert!(send.encoding.opus && send.encoding.key.is_some());
+        assert!(matches!(parse(args(&format!("--key {key}"))), Ok(Command::Receive(o)) if o.key.is_some()));
+        assert!(matches!(parse(args("--device Speakers --volume 50")), Ok(Command::Receive(o)) if o.volume == 0.5 && o.device.as_deref() == Some("Speakers")));
         assert!(matches!(parse(args("send 10.0.0.2:46000 --stdin --rate 44100")), Ok(Command::Send(s)) if s.rate == 44100));
     }
 
@@ -203,6 +379,30 @@ mod tests {
             "send 10.0.0.2:46000 --rate 44100",
             "send 10.0.0.2:46000 --stdin --source 1",
             "send 10.0.0.2:46000 --source",
+            "send --web",
+            "send --web 0",
+            "send --stdin --web 46080",
+            "send 10.0.0.2:46000 --stdin --web 46080",
+            "service",
+            "service install",
+            "service install 10.0.0.2:46000 --stdin",
+            "service status --web 1",
+            "service frobnicate",
+            "--volume 500",
+            "--volume -1",
+            "devices --port 1",
+            "send 10.0.0.2:46000 --volume 50",
+            "send --web 46080 --opus",
+            "--group 10.0.0.1",
+            "send auto:0",
+            "send 10.0.0.2:46000 10.0.0.3:46000 --stdin",
+            "find --volume 3",
+            "send 10.0.0.2:46000 --mic",
+            "--mic",
+            "send 10.0.0.2:46000 --key short",
+            "send 10.0.0.2:46000 --key-file /nonexistent",
+            "keygen extra",
+            "--opus",
             "sources --port 1",
             "--port 0",
             "--port 99999",

@@ -2,9 +2,11 @@
 
 mod capture;
 mod lock;
+mod playback;
 mod pulse;
 mod routing;
 pub mod sender;
+pub mod service;
 
 use std::error::Error;
 

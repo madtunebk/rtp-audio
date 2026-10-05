@@ -63,14 +63,81 @@ To send a single source (a microphone, or a copy of a real output) without chang
 A "Monitor of ..." source is a copy of what that output plays, and it keeps playing on the
 desktop too. IDs can change when the sound server restarts; names don't.
 
+## Smaller and encrypted
+
+By default the sound travels as plain 16-bit audio, about 1.5 Mbit/s, which any RTP L16
+receiver can play. Between two rtp-audio programs you can do better:
+
+```bash
+./rtp-audio keygen > ~/.rtp-audio.key && chmod 600 ~/.rtp-audio.key   # once; copy the file to the other computer
+./rtp-audio send 192.168.1.20:46000 --opus --key-file ~/.rtp-audio.key   # sender
+rtp-audio --key-file rtp-audio.key                                       # receiver
+```
+
+- `--opus` compresses the sound to about 150 kbit/s with no audible difference: fine over Wi-Fi,
+  a VPN or a phone hotspot. A lost packet is filled in by Opus instead of becoming silence.
+- `--key-file` (or `--key KEY`) encrypts and authenticates every packet with ChaCha20-Poly1305.
+  Nobody without the key can listen, change the sound or replay it. A receiver with a key
+  ignores anything not encrypted with it, and tells you why if the keys don't match.
+- Prefer `--key-file`: a `--key` on the command line is visible to other users in `ps`.
+
+The receiver recognises plain, Opus and encrypted sound by itself; only `--key` must be given.
+
+## Finding receivers, and several listeners
+
+On a local network you don't need to look up addresses:
+
+```bash
+./rtp-audio find                      # lists the receivers that are running: name, address
+./rtp-audio send auto                 # sends to the receiver `find` sees, if there's only one
+```
+
+Receivers answer `find` unless started with `--no-discovery`. Discovery uses a broadcast, so it
+stays on the local network: over a VPN, give the address.
+
+To send to several computers, list them, or use a multicast group that any number of receivers
+can join (the group stays on the local network):
+
+```bash
+./rtp-audio send 192.168.1.20:46000 192.168.1.30:46000     # two receivers
+./rtp-audio send 239.255.46.1:46000 --opus                  # a multicast group…
+rtp-audio --group 239.255.46.1                              # …on every receiver that wants it
+```
+
+## Run it automatically
+
+Instead of starting the sender by hand in an SSH session, install it as a user service. It
+then starts with the desktop, restarts if something goes wrong, and switches the sound back when
+stopped:
+
+```bash
+./rtp-audio service install 192.168.1.20:46000     # the same options as `rtp-audio send`
+./rtp-audio service status                          # is it running? recent messages
+./rtp-audio service stop                            # also: start, restart
+./rtp-audio service uninstall                       # stop it and remove it
+```
+
+The service runs the `rtp-audio` file you installed it from, so keep that file where it is. To
+start it at boot without anyone logged in, also run `sudo loginctl enable-linger $USER`; the
+install command tells you when that's needed. No other part of rtp-audio runs external programs:
+`service` uses `systemctl --user`.
+
 ## All options
 
 ```
-rtp-audio [receive] [--port 46000] [--latency 60] [--rate 48000] [--channels 2]
+rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME_OR_ID] [--volume 100]
+                    [--key-file FILE] [--group 239.255.46.1] [--no-discovery]
+rtp-audio find [--port 46000]                                     # receivers on this network
+rtp-audio devices                                                 # outputs for --device
+rtp-audio keygen                                                  # a key for --key / --key-file
 rtp-audio sources
-rtp-audio send HOST:PORT [--source NAME_OR_ID]
+rtp-audio send HOST:PORT [HOST:PORT…] [--source NAME_OR_ID] [--opus] [--key-file FILE]   # or `auto`
 rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]   # raw s16be PCM from stdin
+rtp-audio send --web 46080 [--mic] [HOST:PORT]                   # sound (and microphone) in the browser, see web.md
+rtp-audio service install SEND_OPTIONS | uninstall | status | start | stop | restart
 ```
 
-`--latency` is the receiver's buffer in milliseconds. Something went wrong? See
+`--latency` is the receiver's buffer in milliseconds, `--volume` is in percent (0–400). In a
+terminal, the receiver shows a live status line: packets per second, how full its buffer is,
+problems in the last few seconds, and a level meter of what arrives. Something went wrong? See
 [troubleshooting](troubleshooting.md).

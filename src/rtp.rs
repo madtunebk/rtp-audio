@@ -1,13 +1,17 @@
-//! RTP framing for 16-bit big-endian PCM (L16), as sent by PulseAudio's module-rtp-send,
-//! PipeWire's module-rtp-sink or `ffmpeg -f rtp -acodec pcm_s16be`.
+//! RTP framing: 16-bit big-endian PCM (L16), as sent by PulseAudio's module-rtp-send,
+//! PipeWire's module-rtp-sink or `ffmpeg -f rtp -acodec pcm_s16be`, and Opus (RFC 7587).
 
 pub const HEADER_LEN: usize = 12;
 /// Dynamic payload type, what PulseAudio and ffmpeg use for L16 at 48 kHz.
-pub const PAYLOAD_TYPE: u8 = 97;
+pub const L16: u8 = 97;
+/// Dynamic payload type commonly used for Opus.
+pub const OPUS: u8 = 111;
 
 pub struct Packet<'a> {
+    pub payload_type: u8,
     pub sequence: u16,
-    /// Big-endian i16 samples, interleaved by channel.
+    pub ssrc: u32,
+    /// L16: big-endian i16 samples, interleaved by channel. Opus: one Opus packet.
     pub payload: &'a [u8],
 }
 
@@ -27,14 +31,19 @@ pub fn parse(data: &[u8]) -> Option<Packet<'_>> {
         end = end.checked_sub(*data.last()? as usize)?;
     }
     let payload = data.get(start..end)?;
-    Some(Packet { sequence: u16::from_be_bytes([data[2], data[3]]), payload })
+    Some(Packet {
+        payload_type: data[1] & 0x7f,
+        sequence: u16::from_be_bytes([data[2], data[3]]),
+        ssrc: u32::from_be_bytes([data[8], data[9], data[10], data[11]]),
+        payload,
+    })
 }
 
 /// Write an RTP v2 header for one packet.
-pub fn header(sequence: u16, timestamp: u32, ssrc: u32) -> [u8; HEADER_LEN] {
+pub fn header(sequence: u16, timestamp: u32, ssrc: u32, payload_type: u8) -> [u8; HEADER_LEN] {
     let mut out = [0; HEADER_LEN];
     out[0] = 2 << 6;
-    out[1] = PAYLOAD_TYPE;
+    out[1] = payload_type;
     out[2..4].copy_from_slice(&sequence.to_be_bytes());
     out[4..8].copy_from_slice(&timestamp.to_be_bytes());
     out[8..12].copy_from_slice(&ssrc.to_be_bytes());
@@ -47,10 +56,10 @@ mod tests {
 
     #[test]
     fn round_trips_a_packet() {
-        let mut packet = header(513, 960, 7).to_vec();
+        let mut packet = header(513, 960, 7, super::L16).to_vec();
         packet.extend_from_slice(&[1, 2, 3, 4]);
         let parsed = parse(&packet).unwrap();
-        assert_eq!(parsed.sequence, 513);
+        assert_eq!((parsed.sequence, parsed.ssrc, parsed.payload_type), (513, 7, super::L16));
         assert_eq!(parsed.payload, [1, 2, 3, 4]);
     }
 
