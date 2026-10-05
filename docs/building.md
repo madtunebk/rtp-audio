@@ -13,8 +13,6 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-Release builds for GitHub are made automatically, see [releasing](releasing.md).
-
 ## Runtime requirements and limitations
 
 - The Linux binary links `libpulse.so.0` (`libpulse0` / `pulseaudio-libs`) and `libasound.so.2`

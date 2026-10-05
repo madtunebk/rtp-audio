@@ -6,3 +6,7 @@
 *.zip
 *.sha256
 /rtp-audio-*/
+
+# Maintainer-only notes, kept offline.
+/docs/releasing.md
+/notes-*.md

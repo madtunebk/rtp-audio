@@ -24,5 +24,4 @@ Download from [releases](https://github.com/madtunebk/rtp-audio/releases).
 - [Setup](docs/setup.md): step by step, sending one source, all options
 - [Troubleshooting](docs/troubleshooting.md)
 - [Building](docs/building.md): build, runtime requirements and limitations
-- [Releasing](docs/releasing.md): GitHub release builds
 - [How it works](docs/how-it-works.md)
