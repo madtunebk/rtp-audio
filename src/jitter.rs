@@ -40,6 +40,11 @@ pub struct Stats {
 }
 
 impl Jitter {
+    /// Frames waiting to be played.
+    pub fn buffered(&self) -> usize {
+        self.frames.len()
+    }
+
     pub fn new(target: usize) -> Self {
         Self {
             frames: VecDeque::with_capacity(target * 4),

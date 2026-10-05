@@ -33,6 +33,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Command::Receive(options) => receive::run(options),
+        Command::Devices => receive::list_devices(),
         Command::Send(options) if options.stdin => {
             let destination = options.destination.ok_or("--stdin needs the receiver's address")?;
             transport::send_stdin(destination, options.rate, options.channels)

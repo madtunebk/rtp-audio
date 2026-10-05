@@ -84,7 +84,8 @@ install command tells you when that's needed. No other part of rtp-audio runs ex
 ## All options
 
 ```
-rtp-audio [receive] [--port 46000] [--latency 60] [--rate 48000] [--channels 2]
+rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME_OR_ID] [--volume 100]
+rtp-audio devices                                                 # outputs for --device
 rtp-audio sources
 rtp-audio send HOST:PORT [--source NAME_OR_ID]
 rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]   # raw s16be PCM from stdin
@@ -92,5 +93,7 @@ rtp-audio send --web 46080 [HOST:PORT]                           # sound in the 
 rtp-audio service install SEND_OPTIONS | uninstall | status | start | stop | restart
 ```
 
-`--latency` is the receiver's buffer in milliseconds. Something went wrong? See
+`--latency` is the receiver's buffer in milliseconds, `--volume` is in percent (0–400). In a
+terminal, the receiver shows a live status line: packets per second, how full its buffer is,
+problems in the last few seconds, and a level meter of what arrives. Something went wrong? See
 [troubleshooting](troubleshooting.md).

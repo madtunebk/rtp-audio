@@ -6,8 +6,11 @@ use crate::receive;
 
 pub const USAGE: &str = "\
 usage:
-  rtp-audio [receive] [--port 46000] [--latency 60] [--rate 48000] [--channels 2]
-      play RTP audio (16-bit PCM) arriving on a UDP port; --latency is the buffer in ms
+  rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME] [--volume 100]
+      play RTP audio (16-bit PCM) arriving on a UDP port; --latency is the buffer in ms,
+      --device an output from `rtp-audio devices`, --volume in percent
+  rtp-audio devices
+      list the sound outputs the receiver can play on
   rtp-audio sources
       list this computer's sound sources (Linux)
   rtp-audio send HOST:PORT
@@ -33,6 +36,7 @@ pub enum Command {
     Service { action: String, send_args: Vec<String> },
     Receive(receive::Options),
     Sources,
+    Devices,
     Send(SendOptions),
 }
 
@@ -55,6 +59,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
     let mut positional = Vec::new();
     let (mut port, mut latency_ms, mut rate, mut channels) = (None, None, None, None);
     let (mut source, mut stdin, mut web) = (None, false, None);
+    let (mut device, mut volume) = (None, None);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
@@ -67,8 +72,10 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             "-s" | "--source" => source = Some(value()?),
             "--stdin" => stdin = true,
             "--web" => web = Some(value()?),
+            "--device" => device = Some(value()?),
+            "--volume" => volume = Some(number::<f32>(&arg, &value()?)?),
             _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'\n\n{USAGE}")),
-            "receive" | "send" | "sources" if command.is_none() => command = Some(arg),
+            "receive" | "send" | "sources" | "devices" if command.is_none() => command = Some(arg),
             _ => positional.push(arg),
         }
     }
@@ -84,6 +91,8 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             ("--source", source.is_some()),
             ("--stdin", stdin),
             ("--web", web.is_some()),
+            ("--device", device.is_some()),
+            ("--volume", volume.is_some()),
         ];
         match given.iter().find(|(name, set)| *set && !allowed.contains(name)) {
             Some((name, _)) => Err(format!("{name} can't be used here\n\n{USAGE}")),
@@ -98,6 +107,13 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             match positional.first() {
                 Some(arg) => Err(extra(arg)),
                 None => Ok(Command::Sources),
+            }
+        }
+        Some("devices") => {
+            only(&[])?;
+            match positional.first() {
+                Some(arg) => Err(extra(arg)),
+                None => Ok(Command::Devices),
             }
         }
         Some("send") => {
@@ -132,7 +148,11 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         _ => {
-            only(&["--port", "--latency", "--rate", "--channels"])?;
+            only(&["--port", "--latency", "--rate", "--channels", "--device", "--volume"])?;
+            let volume = volume.unwrap_or(100.0);
+            if !(0.0..=400.0).contains(&volume) {
+                return Err("--volume must be between 0 and 400 (percent)".into());
+            }
             if let Some(arg) = positional.first() {
                 return Err(extra(arg));
             }
@@ -141,6 +161,8 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 latency_ms: nonzero("--latency", latency_ms.unwrap_or(60))?,
                 rate: nonzero("--rate", rate.unwrap_or(48_000))?,
                 channels: channels.unwrap_or(2),
+                device,
+                volume: volume / 100.0,
             }))
         }
     }
@@ -246,6 +268,8 @@ mod tests {
         assert!(send.destination.is_some() && send.web.is_some());
         assert!(matches!(parse(args("service install --web 46080")), Ok(Command::Service { action, send_args }) if action == "install" && send_args.len() == 2));
         assert!(matches!(parse(args("service status")), Ok(Command::Service { .. })));
+        assert!(matches!(parse(args("devices")), Ok(Command::Devices)));
+        assert!(matches!(parse(args("--device Speakers --volume 50")), Ok(Command::Receive(o)) if o.volume == 0.5 && o.device.as_deref() == Some("Speakers")));
         assert!(matches!(parse(args("send 10.0.0.2:46000 --stdin --rate 44100")), Ok(Command::Send(s)) if s.rate == 44100));
     }
 
@@ -267,6 +291,10 @@ mod tests {
             "service install 10.0.0.2:46000 --stdin",
             "service status --web 1",
             "service frobnicate",
+            "--volume 500",
+            "--volume -1",
+            "devices --port 1",
+            "send 10.0.0.2:46000 --volume 50",
             "sources --port 1",
             "--port 0",
             "--port 99999",
