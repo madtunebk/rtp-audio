@@ -21,6 +21,7 @@ pub struct Pulse {
 
 pub struct ServerInfo {
     pub default_sink: Option<String>,
+    pub default_source: Option<String>,
 }
 
 pub struct Source {
@@ -167,6 +168,7 @@ impl Pulse {
             context.introspect().get_server_info(move |info| {
                 reply.send(ServerInfo {
                     default_sink: info.default_sink_name.as_ref().map(|name| name.to_string()),
+                    default_source: info.default_source_name.as_ref().map(|name| name.to_string()),
                 })
             })
         })
@@ -251,6 +253,12 @@ impl Pulse {
     pub fn set_default_sink(&self, name: &str) -> Result<(), Box<dyn Error>> {
         self.act(&format!("making {name} the default output"), |context, reply| {
             context.set_default_sink(name, move |ok| reply.send(ok))
+        })
+    }
+
+    pub fn set_default_source(&self, name: &str) -> Result<(), Box<dyn Error>> {
+        self.act(&format!("making {name} the default input"), |context, reply| {
+            context.set_default_source(name, move |ok| reply.send(ok))
         })
     }
 

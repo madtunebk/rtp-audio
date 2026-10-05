@@ -1,5 +1,6 @@
 //! Automatic mode's routing: an "RTP Audio" null sink made the default output, with the
-//! streams already playing moved onto it, and everything switched back afterwards.
+//! streams already playing moved onto it, and everything switched back afterwards. With the
+//! browser microphone (`--mic`), also an "RTP Audio Microphone" source made the default input.
 //!
 //! Every change is recorded in a state file before or right after it's made. Normal shutdown,
 //! failed startup and recovery after `kill -9` all undo from that record, and only ever touch
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::pulse::{Module, Pulse};
 
 pub const DISPLAY_NAME: &str = "RTP Audio";
+pub const MIC_NAME: &str = "RTP Audio Microphone";
 /// Sink property holding the token, so the sink can be traced back to the run that made it.
 pub const INSTANCE_PROPERTY: &str = "rtp_audio.instance";
 const SINK_PREFIX: &str = "rtp_audio_";
@@ -24,17 +26,29 @@ pub struct State {
     pub original_default: Option<String>,
     /// Streams we moved to our sink, with the name of the sink each came from.
     pub moved: Vec<(u32, String)>,
+    /// The browser microphone: a null sink fed from the browser, and a source made from it.
+    pub mic: bool,
+    /// The default input before we changed it.
+    pub original_default_source: Option<String>,
 }
 
 impl State {
     fn new() -> Self {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos()) as u64;
         let token = nanos ^ u64::from(std::process::id()).rotate_left(40);
-        Self { token: format!("{token:016x}"), original_default: None, moved: Vec::new() }
+        Self { token: format!("{token:016x}"), original_default: None, moved: Vec::new(), mic: false, original_default_source: None }
     }
 
     pub fn sink_name(&self) -> String {
         format!("{SINK_PREFIX}{}", self.token)
+    }
+
+    pub fn mic_feed_name(&self) -> String {
+        format!("{SINK_PREFIX}mic_{}", self.token)
+    }
+
+    pub fn mic_source_name(&self) -> String {
+        format!("{SINK_PREFIX}mic_src_{}", self.token)
     }
 
     fn to_text(&self) -> String {
@@ -46,11 +60,17 @@ impl State {
         for (input, sink) in &self.moved {
             text += &format!("moved={input} {sink}\n");
         }
+        if self.mic {
+            text += "mic=1\n";
+        }
+        if let Some(source) = &self.original_default_source {
+            text += &format!("source={source}\n");
+        }
         text
     }
 
     fn from_text(text: &str) -> Option<Self> {
-        let mut state = Self { token: String::new(), original_default: None, moved: Vec::new() };
+        let mut state = Self { token: String::new(), original_default: None, moved: Vec::new(), mic: false, original_default_source: None };
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             match line.split_once('=')? {
                 ("token", token) => state.token = token.to_string(),
@@ -59,6 +79,8 @@ impl State {
                     let (input, sink) = value.split_once(' ')?;
                     state.moved.push((input.parse().ok()?, sink.to_string()));
                 }
+                ("mic", value) => state.mic = value == "1",
+                ("source", source) => state.original_default_source = Some(source.to_string()),
                 _ => {}
             }
         }
@@ -73,10 +95,14 @@ impl State {
             .map_err(|err| format!("cannot write {}: {err}", path.display()).into())
     }
 
-    /// Is this module the null sink this run loaded?
+    /// Is this module one this run loaded (the output, or the microphone's feed and source)?
     fn owns(&self, module: &Module) -> bool {
-        let sink_name = format!("sink_name={}", self.sink_name());
-        module.name == "module-null-sink" && module.argument.split_whitespace().any(|arg| arg == sink_name)
+        let has = |arg: String| module.argument.split_whitespace().any(|a| a == arg);
+        match module.name.as_str() {
+            "module-null-sink" => has(format!("sink_name={}", self.sink_name())) || has(format!("sink_name={}", self.mic_feed_name())),
+            "module-remap-source" => has(format!("source_name={}", self.mic_source_name())),
+            _ => false,
+        }
     }
 }
 
@@ -118,7 +144,10 @@ impl<'a> Routing<'a> {
 
     /// Create the sink and return the name of its monitor source.
     pub fn create_sink(&mut self) -> Result<String, Box<dyn Error>> {
-        self.state.original_default = self.pulse.server_info()?.default_sink;
+        // With the microphone, this was already noted before its feed could change it.
+        if !self.state.mic {
+            self.state.original_default = self.pulse.server_info()?.default_sink;
+        }
         // Saved before the module exists, so a crash right after loading it is recoverable.
         self.state.save(&self.path)?;
         let sink_name = self.state.sink_name();
@@ -143,6 +172,50 @@ impl<'a> Routing<'a> {
         }
     }
 
+    /// Create the browser microphone: a mono null sink to play the browser's sound into, and a
+    /// source made from its monitor, which becomes the default input. Returns the sink's name.
+    pub fn create_mic(&mut self) -> Result<String, Box<dyn Error>> {
+        let info = self.pulse.server_info()?;
+        self.state.original_default_source = info.default_source;
+        self.state.original_default = info.default_sink;
+        self.state.mic = true;
+        self.state.save(&self.path)?;
+        let (feed, source, token) = (self.state.mic_feed_name(), self.state.mic_source_name(), self.state.token.clone());
+        let fail = |err: Box<dyn Error>| -> Box<dyn Error> { format!("could not create the \"{MIC_NAME}\": {err}").into() };
+        self.pulse
+            .load_module(
+                "module-null-sink",
+                &format!("sink_name={feed} rate=48000 channels=1 sink_properties='device.description=\"{MIC_NAME} (feed)\" {INSTANCE_PROPERTY}={token}'"),
+            )
+            .map_err(fail)?;
+        let monitor = wait_for(|| Ok(self.pulse.sinks()?.into_iter().find(|s| s.name == feed).map(|s| s.monitor_source)))?
+            .ok_or_else(|| fail("its feed did not appear".into()))?;
+        // The feed is an output too, and a server whose only output was its dummy makes it the
+        // default (and drops the dummy): put the default back where that's still possible.
+        if self.pulse.server_info()?.default_sink.as_deref() == Some(&feed)
+            && let Some(original) = self.state.original_default.clone()
+            && self.pulse.sinks()?.iter().any(|sink| sink.name == original)
+        {
+            self.pulse.set_default_sink(&original)?;
+        }
+        self.pulse
+            .load_module(
+                "module-remap-source",
+                &format!("master={monitor} source_name={source} source_properties='device.description=\"{MIC_NAME}\" {INSTANCE_PROPERTY}={token}'"),
+            )
+            .map_err(fail)?;
+        wait_for(|| Ok(self.pulse.sources()?.into_iter().any(|s| s.name == source).then_some(())))?
+            .ok_or_else(|| fail("it did not appear".into()))?;
+        self.pulse.set_default_source(&source).map_err(fail)?;
+        wait_for(|| Ok((self.pulse.server_info()?.default_source.as_deref() == Some(&source)).then_some(())))?;
+        Ok(feed)
+    }
+
+    /// Is the microphone's feed the default output (sounds played here would go into it)?
+    pub fn mic_feed_is_default(&self) -> Result<bool, Box<dyn Error>> {
+        Ok(self.state.mic && self.pulse.server_info()?.default_sink.as_deref() == Some(&self.state.mic_feed_name()))
+    }
+
     pub fn make_default(&mut self) -> Result<(), Box<dyn Error>> {
         let sink_name = self.state.sink_name();
         self.pulse
@@ -162,9 +235,11 @@ impl<'a> Routing<'a> {
         let sinks = self.pulse.sinks()?;
         let sink_name = self.state.sink_name();
         let ours = sinks.iter().find(|sink| sink.name == sink_name).ok_or("the RTP Audio output disappeared")?;
+        let feed = self.state.mic_feed_name();
         for input in self.pulse.sink_inputs()? {
             let Some(from) = sinks.iter().find(|sink| sink.index == input.sink) else { continue };
-            if from.index == ours.index {
+            // Not ours, and not the microphone playing into its feed.
+            if from.index == ours.index || from.name == feed {
                 continue;
             }
             // Some streams refuse to move; they keep playing where they are.
@@ -196,12 +271,39 @@ impl<'a> Routing<'a> {
     }
 }
 
+/// Poll `check` (for up to 3 s, as PipeWire announces things a moment late) until it gives
+/// something.
+fn wait_for<T>(mut check: impl FnMut() -> Result<Option<T>, Box<dyn Error>>) -> Result<Option<T>, Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(found) = check()? {
+            return Ok(Some(found));
+        }
+        if Instant::now() > deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Undo `state` on the server: default output, moved streams, then our module. Each step only
 /// acts if things are still the way we left them, so changes the user made meanwhile stay.
 fn undo(pulse: &Pulse, state: &State, path: &Path) -> Result<(), Box<dyn Error>> {
     let sink_name = state.sink_name();
     let sinks = pulse.sinks()?;
-    let modules: Vec<Module> = pulse.modules()?.into_iter().filter(|module| state.owns(module)).collect();
+    let mut modules: Vec<Module> = pulse.modules()?.into_iter().filter(|module| state.owns(module)).collect();
+    // The microphone's source sits on its feed's monitor: remove it first.
+    modules.sort_by_key(|module| module.name != "module-remap-source");
+
+    if state.mic && pulse.server_info()?.default_source.as_deref() == Some(&state.mic_source_name()) {
+        let sources = pulse.sources()?;
+        if let Some(original) = state.original_default_source.as_ref().and_then(|name| sources.iter().find(|s| &s.name == name)) {
+            match pulse.set_default_source(&original.name) {
+                Ok(()) => eprintln!("Default input switched back to {}", original.description),
+                Err(err) => eprintln!("Could not switch the default input back: {err}"),
+            }
+        }
+    }
     // Our sink, recognised by the token in both its name and its properties.
     let ours = sinks
         .iter()
@@ -234,8 +336,11 @@ fn undo(pulse: &Pulse, state: &State, path: &Path) -> Result<(), Box<dyn Error>>
     for module in &modules {
         pulse.unload_module(module.index)?;
     }
-    if !modules.is_empty() {
+    if modules.iter().any(|m| m.argument.contains(&format!("sink_name={sink_name} "))) {
         eprintln!("Removed the \"{DISPLAY_NAME}\" output");
+    }
+    if modules.iter().any(|m| m.name == "module-remap-source") {
+        eprintln!("Removed the \"{MIC_NAME}\"");
     }
     match std::fs::remove_file(path) {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
@@ -252,6 +357,8 @@ mod tests {
         let mut state = State::new();
         state.original_default = Some("alsa_output.pci-0000_00_1f.3.analog-stereo".into());
         state.moved = vec![(12, "alsa_output.a".into()), (40, "bluez_sink.b".into())];
+        state.mic = true;
+        state.original_default_source = Some("alsa_input.usb-mic".into());
         assert_eq!(State::from_text(&state.to_text()), Some(state));
         assert_eq!(State::from_text("token=xyz\n"), None);
         assert_eq!(State::from_text("garbage"), None);
@@ -266,5 +373,8 @@ mod tests {
         assert!(!state.owns(&module("module-loopback", ours)));
         assert!(!state.owns(&module("module-null-sink", "sink_name=rtp_audio_0000000000000000".into())));
         assert!(!state.owns(&module("module-null-sink", format!("sink_name={}x", state.sink_name()))));
+        assert!(state.owns(&module("module-null-sink", format!("sink_name={} channels=1", state.mic_feed_name()))));
+        assert!(state.owns(&module("module-remap-source", format!("master=x source_name={}", state.mic_source_name()))));
+        assert!(!state.owns(&module("module-remap-source", "source_name=rtp_audio_mic_src_0000000000000000".into())));
     }
 }

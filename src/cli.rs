@@ -27,9 +27,10 @@ usage:
   rtp-audio send HOST:PORT [--opus] [--key KEY | --key-file FILE]
       --opus: about 128 kbit/s instead of 1.5 Mbit/s (needs an rtp-audio receiver);
       --key/--key-file: encrypt (the receiver needs the same key)
-  rtp-audio send --web 127.0.0.1:46080 [HOST:PORT] [--source NAME_OR_ID]
+  rtp-audio send --web 127.0.0.1:46080 [--mic] [HOST:PORT] [--source NAME_OR_ID]
       (also) serve the sound to web browsers, as Opus over a WebSocket, with a player page;
-      put it behind NGINX for HTTPS and a login (see docs/web.md)
+      put it behind NGINX for HTTPS and a login (see docs/web.md). --mic: browsers can also
+      send their microphone, which apps here hear as \"RTP Audio Microphone\"
   rtp-audio service install SEND_OPTIONS
       run `rtp-audio send SEND_OPTIONS` as a user service that starts with the desktop,
       e.g. rtp-audio service install --web 46080
@@ -56,6 +57,8 @@ pub struct SendOptions {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub web: Option<SocketAddr>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub mic: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub source: Option<String>,
     pub stdin: bool,
     pub rate: u32,
@@ -71,7 +74,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
     let (mut port, mut latency_ms, mut rate, mut channels) = (None, None, None, None);
     let (mut source, mut stdin, mut web) = (None, false, None);
     let (mut device, mut volume) = (None, None);
-    let (mut opus, mut key, mut key_file) = (false, None, None);
+    let (mut opus, mut key, mut key_file, mut mic) = (false, None, None, false);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
@@ -86,6 +89,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             "--web" => web = Some(value()?),
             "--device" => device = Some(value()?),
             "--opus" => opus = true,
+            "--mic" => mic = true,
             "--key" => key = Some(value()?),
             "--key-file" => key_file = Some(value()?),
             "--volume" => volume = Some(number::<f32>(&arg, &value()?)?),
@@ -111,6 +115,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             ("--opus", opus),
             ("--key", key.is_some()),
             ("--key-file", key_file.is_some()),
+            ("--mic", mic),
         ];
         match given.iter().find(|(name, set)| *set && !allowed.contains(name)) {
             Some((name, _)) => Err(format!("{name} can't be used here\n\n{USAGE}")),
@@ -158,7 +163,10 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                     return Err("--stdin needs the receiver's address".into());
                 }
             } else {
-                only(&["--source", "--web", "--opus", "--key", "--key-file"])?;
+                only(&["--source", "--web", "--opus", "--key", "--key-file", "--mic"])?;
+                if mic && web.is_none() {
+                    return Err("--mic takes the microphone from browsers: it needs --web".into());
+                }
             }
             if destination.is_none() && (opus || key.is_some() || key_file.is_some()) {
                 return Err("--opus and --key are for the UDP stream to a receiver; the browser mode is \
@@ -172,6 +180,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 destination: destination.as_deref().map(parse_destination).transpose()?,
                 encoding: Encoding { opus, key: read_key(key, key_file)? },
                 web: web.as_deref().map(parse_web).transpose()?,
+                mic,
                 source,
                 stdin,
                 rate: nonzero("--rate", rate.unwrap_or(48_000))?,
@@ -307,6 +316,7 @@ mod tests {
         assert_eq!((send.destination, send.web.map(|a| a.to_string())), (None, Some("127.0.0.1:46080".into())));
         let Ok(Command::Send(send)) = parse(args("send 10.0.0.2:46000 --web 127.0.0.1:46080")) else { panic!() };
         assert!(send.destination.is_some() && send.web.is_some());
+        assert!(matches!(parse(args("send --web 46080 --mic")), Ok(Command::Send(s)) if s.mic));
         assert!(matches!(parse(args("service install --web 46080")), Ok(Command::Service { action, send_args }) if action == "install" && send_args.len() == 2));
         assert!(matches!(parse(args("service status")), Ok(Command::Service { .. })));
         assert!(matches!(parse(args("devices")), Ok(Command::Devices)));
@@ -342,6 +352,8 @@ mod tests {
             "devices --port 1",
             "send 10.0.0.2:46000 --volume 50",
             "send --web 46080 --opus",
+            "send 10.0.0.2:46000 --mic",
+            "--mic",
             "send 10.0.0.2:46000 --key short",
             "send 10.0.0.2:46000 --key-file /nonexistent",
             "keygen extra",

@@ -6,10 +6,15 @@
 //!   GET /            a bare page with just the player, for testing
 //!   GET /ws          the WebSocket: one text message describing the stream, then one binary
 //!                    message per 20 ms frame (Opus, or s16le PCM with ?codec=pcm)
+//!   GET /config.json what the player may offer: {"mic": true} with `send --web … --mic`
+//!   GET /mic         the WebSocket the browser sends its microphone on (48 kHz mono, 20 ms
+//!                    Opus frames, or s16le PCM with ?codec=pcm); one browser at a time
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -70,6 +75,53 @@ impl Hub {
     }
 }
 
+/// The browser's microphone, between the WebSocket and the sound server: 48 kHz mono samples.
+#[derive(Default)]
+pub struct MicFeed {
+    queue: Mutex<MicQueue>,
+    busy: AtomicBool,
+}
+
+#[derive(Default)]
+struct MicQueue {
+    samples: VecDeque<i16>,
+    playing: bool,
+}
+
+/// Wait for 40 ms before playing (frames come in bursts over TCP); keep at most 250 ms so the
+/// microphone never lags behind.
+const MIC_START: usize = 1920;
+const MIC_MAX: usize = 12_000;
+
+impl MicFeed {
+    fn push(&self, samples: &[i16]) {
+        let mut queue = self.queue.lock().unwrap();
+        queue.samples.extend(samples);
+        let excess = queue.samples.len().saturating_sub(MIC_MAX);
+        queue.samples.drain(..excess);
+    }
+
+    /// Fill `out` with what has arrived, silence for the rest.
+    pub fn take(&self, out: &mut [i16]) {
+        let mut queue = self.queue.lock().unwrap();
+        if !queue.playing && queue.samples.len() < MIC_START {
+            out.fill(0);
+            return;
+        }
+        queue.playing = true;
+        for sample in out.iter_mut() {
+            *sample = queue.samples.pop_front().unwrap_or_else(|| {
+                queue.playing = false;
+                0
+            });
+        }
+    }
+
+    fn clear(&self) {
+        *self.queue.lock().unwrap() = MicQueue::default();
+    }
+}
+
 /// Encodes the captured sound once and hands it to every browser listening.
 pub struct WebSink {
     hub: Arc<Hub>,
@@ -78,16 +130,18 @@ pub struct WebSink {
     packet: Vec<u8>,
 }
 
-/// Start serving browsers on `address`. Returns the sink to feed captured sound into.
-pub fn start(address: SocketAddr) -> Result<WebSink, Box<dyn std::error::Error>> {
+/// Start serving browsers on `address`; with `mic`, also take a browser's microphone. Returns
+/// the sink to feed captured sound into.
+pub fn start(address: SocketAddr, mic: Option<Arc<MicFeed>>) -> Result<WebSink, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(address).map_err(|err| format!("cannot listen on {address}: {err}"))?;
     let hub = Arc::new(Hub::default());
     let server_hub = Arc::clone(&hub);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let hub = Arc::clone(&server_hub);
+            let mic = mic.clone();
             std::thread::spawn(move || {
-                if let Err(err) = serve(stream, &hub) {
+                if let Err(err) = serve(stream, &hub, mic.as_deref()) {
                     eprintln!("Web listener: {err}");
                 }
             });
@@ -132,7 +186,7 @@ impl WebSink {
 }
 
 /// One connection: a WebSocket listener, or a plain request for the player.
-fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), Box<dyn std::error::Error>> {
+fn serve(mut stream: TcpStream, hub: &Hub, mic: Option<&MicFeed>) -> Result<(), Box<dyn std::error::Error>> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let head = peek_head(&stream)?;
     let request_line = head.lines().next().unwrap_or_default();
@@ -160,12 +214,36 @@ fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), Box<dyn std::error::Err
         return Ok(());
     }
 
+    if upgrade && (path == "/mic" || path.starts_with("/mic?"))
+        && let Some(mic) = mic
+    {
+        {
+            let pcm = path.contains("codec=pcm");
+            let mut socket = tungstenite::accept(stream)?;
+            socket.get_mut().set_read_timeout(None)?;
+            if mic.busy.swap(true, Ordering::SeqCst) {
+                let _ = socket.close(Some(tungstenite::protocol::CloseFrame {
+                    code: tungstenite::protocol::frame::coding::CloseCode::Policy,
+                    reason: "another browser is using the microphone".into(),
+                }));
+                let _ = socket.flush();
+                return Ok(());
+            }
+            let result = receive_mic(&mut socket, mic, pcm);
+            mic.clear();
+            mic.busy.store(false, Ordering::SeqCst);
+            return result;
+        }
+    }
+
     // Consume the request we only peeked at, then answer it.
     let mut discard = vec![0; head.len()];
     stream.read_exact(&mut discard)?;
+    let config = format!(r#"{{"mic":{}}}"#, mic.is_some());
     let (status, kind, body) = match path.split('?').next().unwrap_or("/") {
         "/player.js" => ("200 OK", "text/javascript; charset=utf-8", PLAYER),
         "/" => ("200 OK", "text/html; charset=utf-8", PAGE),
+        "/config.json" => ("200 OK", "application/json", config.as_str()),
         _ => ("404 Not Found", "text/plain; charset=utf-8", "not found\n"),
     };
     write!(
@@ -174,6 +252,29 @@ fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), Box<dyn std::error::Err
          X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )?;
+    Ok(())
+}
+
+/// Feed one browser's microphone into `mic` until it disconnects.
+fn receive_mic(socket: &mut tungstenite::WebSocket<TcpStream>, mic: &MicFeed, pcm: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let mut decoder = opus::Decoder::new(RATE, opus::Channels::Mono)?;
+    let mut samples = vec![0i16; 5760];
+    eprintln!("Browser microphone connected");
+    loop {
+        match socket.read() {
+            Ok(Message::Binary(data)) if pcm => {
+                let frame: Vec<i16> = data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+                mic.push(&frame);
+            }
+            Ok(Message::Binary(data)) => match decoder.decode(&data, &mut samples, false) {
+                Ok(n) => mic.push(&samples[..n]),
+                Err(err) => eprintln!("Browser microphone: bad Opus frame ({err})"),
+            },
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    eprintln!("Browser microphone disconnected");
     Ok(())
 }
 
@@ -213,5 +314,22 @@ mod tests {
         assert_eq!(slow.try_iter().count(), super::QUEUE);
         assert_eq!(hub.listeners.lock().unwrap().len(), 1);
         assert!(!hub.wants(Codec::Pcm));
+    }
+
+    #[test]
+    fn mic_waits_for_40_ms_then_plays_and_fills_gaps_with_silence() {
+        let mic = super::MicFeed::default();
+        let mut out = vec![1i16; 960];
+        mic.push(&[7; 960]);
+        mic.take(&mut out);
+        assert!(out.iter().all(|&s| s == 0)); // not enough yet
+        mic.push(&[7; 960]);
+        mic.take(&mut out);
+        assert!(out.iter().all(|&s| s == 7));
+        mic.take(&mut vec![0i16; 960]);
+        mic.take(&mut out); // ran dry
+        assert!(out.iter().all(|&s| s == 0));
+        mic.push(&[1; 20_000]);
+        assert_eq!(mic.queue.lock().unwrap().samples.len(), super::MIC_MAX);
     }
 }

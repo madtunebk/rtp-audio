@@ -2,6 +2,7 @@
 
 mod capture;
 mod lock;
+mod playback;
 mod pulse;
 mod routing;
 pub mod sender;

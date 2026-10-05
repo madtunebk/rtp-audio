@@ -110,7 +110,7 @@ rtp-audio keygen                                                  # a key for --
 rtp-audio sources
 rtp-audio send HOST:PORT [--source NAME_OR_ID] [--opus] [--key-file FILE]
 rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]   # raw s16be PCM from stdin
-rtp-audio send --web 46080 [HOST:PORT]                           # sound in the browser, see web.md
+rtp-audio send --web 46080 [--mic] [HOST:PORT]                   # sound (and microphone) in the browser, see web.md
 rtp-audio service install SEND_OPTIONS | uninstall | status | start | stop | restart
 ```
 

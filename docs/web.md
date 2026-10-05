@@ -88,6 +88,24 @@ starts by itself.
 If the sender restarts, the player reconnects by itself (⏳). Without a login, `/audio/` answers
 `401`, so nobody can listen without an account.
 
+## Your microphone, the other way
+
+Add `--mic` to also send your microphone to the remote desktop, e.g. for a call in a browser or
+app running there:
+
+```bash
+./rtp-audio send --web 46080 --mic
+```
+
+The page then shows a second button, 🎙️. Click it and allow the microphone: the desktop gets a
+new input, **"RTP Audio Microphone"**, made the default while rtp-audio runs, so apps pick it up
+by themselves. Your browser cleans the sound up first (echo cancellation, noise suppression),
+compresses it to Opus (about 64 kbit/s) and sends it through the same HTTPS connection and
+login. One browser at a time can use it; the next one is told the microphone is busy.
+
+Use headphones: the browser can't cancel the desktop's own sound coming out of your speakers.
+When rtp-audio stops, the default input is switched back, and the microphone removed.
+
 ## Details
 
 - Browsers: current Chrome, Edge, Firefox and Safari. Opus is decoded by the browser
@@ -95,8 +113,9 @@ If the sender restarts, the player reconnects by itself (⏳). Without a login, 
 - Bandwidth with Opus: about 128 kbit/s per listener.
 - Latency: about 150 ms plus the network: the player keeps 120 ms of sound in reserve to ride out
   network hiccups, and skips ahead if it falls further behind.
-- Troubleshooting: in the browser console, `rtpAudio` shows the frames received and decoded and
-  the current level.
+- Troubleshooting: in the browser console, `rtpAudio` shows the frames received and decoded, the
+  current level, and with the microphone on, `rtpAudio.mic.sent`.
+- The microphone needs HTTPS (browsers only allow it on secure pages), which NGINX provides.
 - Without NGINX, for a quick test through an SSH tunnel, open `http://127.0.0.1:46080/` directly.
   Never serve on a public address without NGINX: the audio server itself has no login. It warns
   if you try.

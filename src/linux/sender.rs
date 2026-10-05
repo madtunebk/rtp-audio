@@ -8,12 +8,15 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+use std::sync::Arc;
+
 use super::capture::{self, Capture};
+use super::playback::Playback;
 use super::pulse::Pulse;
-use super::routing::{self, DISPLAY_NAME, Routing};
+use super::routing::{self, DISPLAY_NAME, MIC_NAME, Routing};
 use super::{Event, fail_point, lock};
 use crate::transport::{AudioSink, Encoding, RtpSender};
-use crate::web;
+use crate::web::{self, MicFeed};
 
 /// Ctrl+C (or SIGTERM) arrived before streaming started.
 #[derive(Debug)]
@@ -27,13 +30,16 @@ impl fmt::Display for Interrupted {
 
 impl Error for Interrupted {}
 
-/// Send to a receiver at `destination`, to browsers through a server on `web`, or both.
+/// Send to a receiver at `destination`, to browsers through a server on `web`, or both. With
+/// `mic`, browsers can also send their microphone, which apps here hear as "RTP Audio Microphone".
 pub fn run(
     destination: Option<SocketAddr>,
     encoding: Encoding,
     source: Option<&str>,
     web: Option<SocketAddr>,
+    mic: bool,
 ) -> Result<(), Box<dyn Error>> {
+    let mic = mic.then(|| Arc::new(MicFeed::default()));
     // Fail on a bad network or a busy port before touching any sound settings.
     let mut sinks: Vec<Box<dyn AudioSink>> = Vec::new();
     let mut targets = Vec::new();
@@ -44,7 +50,7 @@ pub fn run(
         sinks.push(Box::new(rtp));
     }
     if let Some(address) = web {
-        sinks.push(Box::new(web::start(address)?));
+        sinks.push(Box::new(web::start(address, mic.clone())?));
         targets.push(format!("browsers (http://{address})"));
         if !address.ip().is_loopback() {
             eprintln!(
@@ -63,17 +69,40 @@ pub fn run(
     routing::recover(&pulse, &state)?;
     check_interrupted(&stop)?;
 
-    let result = match source {
-        Some(source) => send_source(&pulse, source, sinks, events, &stop, &target),
-        None => send_all(&pulse, state, sinks, events, &stop, &target),
-    };
+    let mut routing = Routing::new(&pulse, state);
+    let result = (|| {
+        // The microphone first: with it, a call can start before the sound does.
+        let _mic = mic.map(|feed| start_mic(&pulse, &mut routing, feed)).transpose()?;
+        check_interrupted(&stop)?;
+        if source.is_some() && routing.mic_feed_is_default()? {
+            eprintln!(
+                "Warning: there is no other output, so sounds played here go into \"{MIC_NAME}\" too. \
+                 Without --source, \"{DISPLAY_NAME}\" becomes the default output instead."
+            );
+        }
+        match source {
+            Some(source) => send_source(&pulse, source, sinks, events, &stop, &target),
+            None => send_all(&pulse, &mut routing, sinks, events, &stop, &target),
+        }
+    })();
+    // Runs whatever happened above, including a failure halfway through starting.
+    routing.restore();
     match result {
         Err(err) if err.is::<Interrupted>() => Ok(()),
         result => result,
     }
 }
 
-/// Explicit source mode: record one source; no sound settings change.
+/// The browser microphone: create "RTP Audio Microphone" and play what browsers send into it.
+fn start_mic<'a>(pulse: &'a Pulse, routing: &mut Routing, feed: Arc<MicFeed>) -> Result<Playback<'a>, Box<dyn Error>> {
+    let sink = routing.create_mic()?;
+    fail_point("mic")?;
+    let playback = Playback::start(pulse, &sink, feed)?;
+    eprintln!("Browser microphone: \"{MIC_NAME}\" is now the default input.");
+    Ok(playback)
+}
+
+/// Explicit source mode: record one source; no output settings change.
 fn send_source(
     pulse: &Pulse,
     wanted: &str,
@@ -96,14 +125,13 @@ fn send_source(
 /// Automatic mode: everything this computer plays goes to the "RTP Audio" output, which we send.
 fn send_all(
     pulse: &Pulse,
-    state: std::path::PathBuf,
+    routing: &mut Routing,
     sinks: Vec<Box<dyn AudioSink>>,
     events: Sender<Event>,
     stop: &Receiver<Event>,
     target: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let mut routing = Routing::new(pulse, state);
-    let result = (|| {
+    (|| {
         let monitor = routing.create_sink()?;
         fail_point("sink")?;
         check_interrupted(stop)?;
@@ -125,10 +153,7 @@ fn send_all(
             }
         );
         wait(pulse, stop, target)
-    })();
-    // Runs whatever happened above, including a failure halfway through starting.
-    routing.restore();
-    result
+    })()
 }
 
 /// Stream until Ctrl+C, SIGTERM or an error.
