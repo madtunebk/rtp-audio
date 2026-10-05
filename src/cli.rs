@@ -34,13 +34,15 @@ usage:
       --opus: about 128 kbit/s instead of 1.5 Mbit/s (needs an rtp-audio receiver);
       --key/--key-file: encrypt (the receiver needs the same key)
   rtp-audio send --web 127.0.0.1:46080 [--mic] [HOST:PORT] [--source NAME_OR_ID]
-      (also) serve the sound to web browsers, as Opus over a WebSocket, with a player page;
+      (also) serve the sound to web browsers as Opus over a WebSocket, with a noVNC player;
       put it behind NGINX for HTTPS and a login (see docs/web.md). --mic: browsers can also
       send their microphone, which apps here hear as \"RTP Audio Microphone\"
   rtp-audio service install SEND_OPTIONS
       run `rtp-audio send SEND_OPTIONS` as a user service that starts with the desktop,
       e.g. rtp-audio service install --web 46080
   rtp-audio service uninstall | status | start | stop | restart
+  rtp-audio version
+      print the version (also --version)
   rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]
       send raw big-endian 16-bit PCM read from stdin
 
@@ -48,6 +50,7 @@ HOST is the receiving computer, e.g. rtp-audio send 192.168.1.20:46000";
 
 pub enum Command {
     Help,
+    Version,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Service { action: String, send_args: Vec<String> },
     Receive(receive::Options),
@@ -75,8 +78,10 @@ pub struct SendOptions {
 }
 
 pub fn parse(args: Vec<String>) -> Result<Command, String> {
-    if args.first().map(String::as_str) == Some("service") {
-        return parse_service(args);
+    match args.first().map(String::as_str) {
+        Some("service") => return parse_service(args),
+        Some("version") => return Ok(Command::Version),
+        _ => {}
     }
     let mut command: Option<String> = None;
     let mut positional = Vec::new();
@@ -90,6 +95,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
             "-h" | "--help" | "help" => return Ok(Command::Help),
+            "-V" | "--version" => return Ok(Command::Version),
             "--port" => port = Some(number::<u16>(&arg, &value()?)?),
             "--latency" => latency_ms = Some(number::<u32>(&arg, &value()?)?),
             "--rate" => rate = Some(number::<u32>(&arg, &value()?)?),
@@ -362,6 +368,9 @@ mod tests {
         assert!(matches!(parse(args("service status")), Ok(Command::Service { .. })));
         assert!(matches!(parse(args("devices")), Ok(Command::Devices)));
         assert!(matches!(parse(args("keygen")), Ok(Command::Keygen)));
+        assert!(matches!(parse(args("version")), Ok(Command::Version)));
+        assert!(matches!(parse(args("--version")), Ok(Command::Version)));
+        assert!(matches!(parse(args("send 10.0.0.2:46000 -V")), Ok(Command::Version)));
         let key = crate::secure::generate().unwrap();
         let Ok(Command::Send(send)) = parse(args(&format!("send 10.0.0.2:46000 --opus --key {key}"))) else { panic!() };
         assert!(send.encoding.opus && send.encoding.key.is_some());

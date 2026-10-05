@@ -34,6 +34,10 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             println!("{}", cli::USAGE);
             Ok(())
         }
+        Command::Version => {
+            println!("rtp-audio {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Command::Receive(options) => receive::run(options),
         Command::Devices => receive::list_devices(),
         Command::Keygen => {
