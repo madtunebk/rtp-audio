@@ -50,6 +50,11 @@ pub fn acquire() -> Result<SenderLock, Box<dyn Error>> {
             let mut pid = String::new();
             let _ = file.read_to_string(&mut pid);
             let pid = pid.trim();
+            if pid.parse().is_ok_and(super::service::is_service_process) {
+                return Err("sender already running as the rtp-audio service. \
+                    Stop it with `rtp-audio service stop` (or remove it: `rtp-audio service uninstall`)."
+                    .into());
+            }
             let which = if pid.is_empty() { String::new() } else { format!(" (process {pid})") };
             return Err(format!(
                 "sender already running{which}. Stop it first with Ctrl+C in its terminal{}.",

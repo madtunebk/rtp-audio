@@ -24,6 +24,16 @@ e.g. `rtp-audio send 192.168.1.20:46000 --web 46080`, or serve a single source w
 Opus is only encoded while at least one browser listens, about 1–2% of one CPU core, and once
 for all listeners.
 
+To have it start with the desktop, and keep running after you log out of SSH, install it as a
+service instead:
+
+```bash
+./rtp-audio service install --web 46080
+```
+
+`rtp-audio service status`, `stop`, `start` and `uninstall` manage it; see
+[running as a service](setup.md#run-it-automatically).
+
 ## 2. Add it to NGINX
 
 ```bash

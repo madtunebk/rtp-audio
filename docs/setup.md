@@ -63,6 +63,24 @@ To send a single source (a microphone, or a copy of a real output) without chang
 A "Monitor of ..." source is a copy of what that output plays, and it keeps playing on the
 desktop too. IDs can change when the sound server restarts; names don't.
 
+## Run it automatically
+
+Instead of starting the sender by hand in an SSH session, install it as a user service. It
+then starts with the desktop, restarts if something goes wrong, and switches the sound back when
+stopped:
+
+```bash
+./rtp-audio service install 192.168.1.20:46000     # the same options as `rtp-audio send`
+./rtp-audio service status                          # is it running? recent messages
+./rtp-audio service stop                            # also: start, restart
+./rtp-audio service uninstall                       # stop it and remove it
+```
+
+The service runs the `rtp-audio` file you installed it from, so keep that file where it is. To
+start it at boot without anyone logged in, also run `sudo loginctl enable-linger $USER`; the
+install command tells you when that's needed. No other part of rtp-audio runs external programs:
+`service` uses `systemctl --user`.
+
 ## All options
 
 ```
@@ -70,6 +88,8 @@ rtp-audio [receive] [--port 46000] [--latency 60] [--rate 48000] [--channels 2]
 rtp-audio sources
 rtp-audio send HOST:PORT [--source NAME_OR_ID]
 rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]   # raw s16be PCM from stdin
+rtp-audio send --web 46080 [HOST:PORT]                           # sound in the browser, see web.md
+rtp-audio service install SEND_OPTIONS | uninstall | status | start | stop | restart
 ```
 
 `--latency` is the receiver's buffer in milliseconds. Something went wrong? See

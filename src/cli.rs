@@ -18,6 +18,10 @@ usage:
   rtp-audio send --web 127.0.0.1:46080 [HOST:PORT] [--source NAME_OR_ID]
       (also) serve the sound to web browsers, as Opus over a WebSocket, with a player page;
       put it behind NGINX for HTTPS and a login (see docs/web.md)
+  rtp-audio service install SEND_OPTIONS
+      run `rtp-audio send SEND_OPTIONS` as a user service that starts with the desktop,
+      e.g. rtp-audio service install --web 46080
+  rtp-audio service uninstall | status | start | stop | restart
   rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]
       send raw big-endian 16-bit PCM read from stdin
 
@@ -25,6 +29,8 @@ HOST is the receiving computer, e.g. rtp-audio send 192.168.1.20:46000";
 
 pub enum Command {
     Help,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Service { action: String, send_args: Vec<String> },
     Receive(receive::Options),
     Sources,
     Send(SendOptions),
@@ -42,6 +48,9 @@ pub struct SendOptions {
 }
 
 pub fn parse(args: Vec<String>) -> Result<Command, String> {
+    if args.first().map(String::as_str) == Some("service") {
+        return parse_service(args);
+    }
     let mut command: Option<String> = None;
     let mut positional = Vec::new();
     let (mut port, mut latency_ms, mut rate, mut channels) = (None, None, None, None);
@@ -137,6 +146,24 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
     }
 }
 
+/// `service ACTION [send options]`; install checks the options like `send` would.
+fn parse_service(args: Vec<String>) -> Result<Command, String> {
+    let mut args = args.into_iter().skip(1);
+    let action = args.next().ok_or(format!("service needs an action: install, uninstall, status, start, stop or restart\n\n{USAGE}"))?;
+    let send_args: Vec<String> = args.collect();
+    match action.as_str() {
+        "-h" | "--help" => Ok(Command::Help),
+        "install" => match parse(std::iter::once("send".to_string()).chain(send_args.iter().cloned()).collect())? {
+            Command::Send(options) if !options.stdin => Ok(Command::Service { action, send_args }),
+            Command::Send(_) => Err("the service can't read from --stdin".into()),
+            _ => Ok(Command::Help),
+        },
+        "uninstall" | "status" | "start" | "stop" | "restart" if send_args.is_empty() => Ok(Command::Service { action, send_args }),
+        "uninstall" | "status" | "start" | "stop" | "restart" => Err(format!("service {action} takes no options")),
+        _ => Err(format!("unknown service action '{action}'\n\n{USAGE}")),
+    }
+}
+
 fn number<T: std::str::FromStr>(option: &str, text: &str) -> Result<T, String> {
     text.parse().map_err(|_| format!("{option}: '{text}' is not a valid number"))
 }
@@ -217,6 +244,8 @@ mod tests {
         assert_eq!((send.destination, send.web.map(|a| a.to_string())), (None, Some("127.0.0.1:46080".into())));
         let Ok(Command::Send(send)) = parse(args("send 10.0.0.2:46000 --web 127.0.0.1:46080")) else { panic!() };
         assert!(send.destination.is_some() && send.web.is_some());
+        assert!(matches!(parse(args("service install --web 46080")), Ok(Command::Service { action, send_args }) if action == "install" && send_args.len() == 2));
+        assert!(matches!(parse(args("service status")), Ok(Command::Service { .. })));
         assert!(matches!(parse(args("send 10.0.0.2:46000 --stdin --rate 44100")), Ok(Command::Send(s)) if s.rate == 44100));
     }
 
@@ -233,6 +262,11 @@ mod tests {
             "send --web 0",
             "send --stdin --web 46080",
             "send 10.0.0.2:46000 --stdin --web 46080",
+            "service",
+            "service install",
+            "service install 10.0.0.2:46000 --stdin",
+            "service status --web 1",
+            "service frobnicate",
             "sources --port 1",
             "--port 0",
             "--port 99999",

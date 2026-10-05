@@ -5,6 +5,7 @@ mod lock;
 mod pulse;
 mod routing;
 pub mod sender;
+pub mod service;
 
 use std::error::Error;
 
