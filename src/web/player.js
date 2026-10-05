@@ -57,33 +57,109 @@
     }
     registerProcessor("rtp-audio-mic", RtpAudioMic);`;
 
-  const makeButton = (right) => {
-    const b = document.createElement("button");
-    b.type = "button";
-    Object.assign(b.style, {
-      position: "fixed", right, bottom: "16px", zIndex: 2147483647, width: "48px", height: "48px",
-      borderRadius: "50%", border: "1px solid rgba(255,255,255,.25)", background: "rgba(20,24,32,.85)",
-      color: "#fff", fontSize: "22px", cursor: "pointer", boxShadow: "0 4px 16px rgba(0,0,0,.4)",
-    });
-    return b;
+  // White 25×25 icons in noVNC's style.
+  const svg = (body) => "data:image/svg+xml," + encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="25" height="25" viewBox="0 0 25 25" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`);
+  const SPEAKER = '<path d="M3.5 10h4l5-4v13l-5-4h-4z" fill="#fff"/>';
+  const MIC = '<rect x="9.5" y="3" width="6" height="11" rx="3" fill="#fff"/><path d="M6.5 11.5a6 6 0 0 0 12 0M12.5 17.5v4M9 21.5h7"/>';
+  const ICONS = {
+    sound: {
+      off: svg(SPEAKER + '<path d="M16 9.5l5 5M21 9.5l-5 5"/>'),
+      on: svg(SPEAKER + '<path d="M15.5 9a4.5 4.5 0 0 1 0 7M18 6.5a8 8 0 0 1 0 12"/>'),
+    },
+    mic: {
+      off: svg(MIC + '<path d="M4 3.5l17 18" stroke="#e5484d"/>'),
+      on: svg(MIC),
+    },
+    wait: svg('<circle cx="6" cy="12.5" r="1.6" fill="#fff"/><circle cx="12.5" cy="12.5" r="1.6" fill="#fff"/><circle cx="19" cy="12.5" r="1.6" fill="#fff"/>'),
+    warn: svg('<path d="M12.5 3.5l10 17h-20z"/><path d="M12.5 10v5M12.5 18v.5"/>'),
   };
-  const button = makeButton("16px");
-  const show = (icon, title) => { button.textContent = icon; button.title = title; button.setAttribute("aria-label", title); };
-  show("🔇", "Desktop sound: off (click to turn on)");
-  document.body.append(button);
+  const EMOJI = { sound: { off: "🔇", on: "🔊" }, mic: { off: "🎙️", on: "🎙️" }, wait: "⏳", warn: "⚠️" };
+
+  // A toggle in noVNC's control bar (next to Clipboard and Full screen) when the page has one,
+  // otherwise a floating button in the corner. set(state, title) with state off, on, wait, warn.
+  const bar = document.querySelector("#noVNC_control_bar .noVNC_scroll");
+  let floating = 0;
+  function control(kind) {
+    let el;
+    if (bar) {
+      el = document.createElement("input");
+      el.type = "image";
+      el.className = "noVNC_button";
+      const before = document.getElementById("noVNC_fullscreen_button") || document.getElementById("noVNC_settings_button");
+      bar.insertBefore(el, before && before.parentNode === bar ? before : null);
+    } else {
+      el = document.createElement("button");
+      el.type = "button";
+      Object.assign(el.style, {
+        position: "fixed", right: "16px", bottom: `${16 + 64 * floating++}px`, zIndex: 2147483647, width: "48px",
+        height: "48px", borderRadius: "50%", border: "1px solid rgba(255,255,255,.25)", background: "rgba(20,24,32,.85)",
+        color: "#fff", fontSize: "22px", cursor: "pointer", boxShadow: "0 4px 16px rgba(0,0,0,.4)",
+      });
+      document.body.append(el);
+    }
+    return {
+      el,
+      set(state, title) {
+        el.title = title;
+        el.setAttribute("aria-label", title);
+        if (bar) {
+          el.src = ICONS[kind][state] || ICONS[state];
+          el.alt = title;
+          el.classList.toggle("noVNC_selected", state === "on");
+        } else {
+          el.textContent = EMOJI[kind][state] || EMOJI[state];
+          el.style.boxShadow = state === "on" ? "0 0 0 3px #4f9cf9, 0 4px 16px rgba(0,0,0,.4)" : "0 4px 16px rgba(0,0,0,.4)";
+        }
+      },
+    };
+  }
+
+  const sound = control("sound");
+  const button = sound.el;
+  const show = (state, title) => sound.set(state, title);
+  show("off", "Desktop sound: off (click to turn on)");
 
   let session = null;
   // For troubleshooting from the browser console.
   const stats = (window.rtpAudio = { received: 0, decoded: 0, level: 0, codec: null });
 
   button.addEventListener("click", () => {
-    if (session) { session.stop(); session = null; show("🔇", "Desktop sound: off (click to turn on)"); }
+    if (session) { session.stop(); session = null; show("off", "Desktop sound: off (click to turn on)"); }
     else session = start();
   });
 
+  // Left and right channels from a decoded AudioData, whatever layout the browser chose: not
+  // every browser converts to the format asked for.
+  function stereo(data) {
+    const n = data.numberOfFrames, channels = data.numberOfChannels;
+    const left = new Float32Array(n), right = new Float32Array(n);
+    try {
+      data.copyTo(left, { planeIndex: 0, format: "f32-planar" });
+      data.copyTo(right, { planeIndex: channels > 1 ? 1 : 0, format: "f32-planar" });
+      return [left, right];
+    } catch {}
+    const planar = data.format.endsWith("-planar"), float = data.format.startsWith("f32");
+    const scale = float ? 1 : 1 / 32768;
+    const read = (plane) => {
+      const size = data.allocationSize({ planeIndex: plane });
+      const raw = float ? new Float32Array(size / 4) : new Int16Array(size / 2);
+      data.copyTo(raw, { planeIndex: plane });
+      return raw;
+    };
+    if (planar) {
+      const l = read(0), r = channels > 1 ? read(1) : l;
+      for (let i = 0; i < n; i++) { left[i] = l[i] * scale; right[i] = r[i] * scale; }
+    } else {
+      const all = read(0);
+      for (let i = 0; i < n; i++) { left[i] = all[i * channels] * scale; right[i] = all[i * channels + (channels > 1 ? 1 : 0)] * scale; }
+    }
+    return [left, right];
+  }
+
   function start() {
     let ws, context, node, decoder, retry, stopped = false, timestamp = 0;
-    show("⏳", "Desktop sound: connecting…");
+    show("wait", "Desktop sound: connecting…");
 
     const playPcm = (left, right) => {
       let sum = 0;
@@ -106,9 +182,7 @@
       if (opus && !decoder) {
         decoder = new AudioDecoder({
           output: (data) => {
-            const left = new Float32Array(data.numberOfFrames), right = new Float32Array(data.numberOfFrames);
-            data.copyTo(left, { planeIndex: 0, format: "f32-planar" });
-            data.copyTo(right, { planeIndex: 1, format: "f32-planar" });
+            const [left, right] = stereo(data);
             data.close();
             playPcm(left, right);
           },
@@ -119,7 +193,7 @@
       ws = new WebSocket(wsUrl + (opus ? "" : "?codec=pcm"));
       ws.binaryType = "arraybuffer";
       stats.codec = opus ? "opus" : "pcm";
-      ws.onopen = () => show("🔊", `Desktop sound: on (${opus ? "Opus" : "PCM"}, click to turn off)`);
+      ws.onopen = () => show("on", `Desktop sound: on (${opus ? "Opus" : "PCM"}, click to turn off)`);
       ws.onmessage = (event) => {
         if (typeof event.data === "string") return;
         stats.received++;
@@ -136,14 +210,14 @@
       // The sender restarted or the network blinked: try again shortly.
       ws.onclose = () => {
         if (stopped) return;
-        show("⏳", "Desktop sound: reconnecting…");
+        show("wait", "Desktop sound: reconnecting…");
         retry = setTimeout(() => open().catch(fail), 2000);
       };
     }
 
     function fail(err) {
       console.warn("rtp-audio:", err);
-      show("⚠️", `Desktop sound: ${err.message || err} (click to retry)`);
+      show("warn", `Desktop sound: ${err.message || err} (click to retry)`);
       stop();
       session = null;
     }
@@ -167,23 +241,20 @@
     .catch(() => {});
 
   function addMic() {
-    const mic = makeButton("72px");
-    const showMic = (icon, title, on) => {
-      mic.textContent = icon; mic.title = title; mic.setAttribute("aria-label", title);
-      mic.style.boxShadow = on ? "0 0 0 3px #e5484d, 0 4px 16px rgba(0,0,0,.4)" : "0 4px 16px rgba(0,0,0,.4)";
-    };
-    showMic("🎙️", "Microphone: off (click to send your microphone to the desktop)", false);
-    document.body.append(mic);
+    const micControl = control("mic");
+    const mic = micControl.el;
+    const showMic = (state, title) => micControl.set(state, title);
+    showMic("off", "Microphone: off (click to send your microphone to the desktop)");
     stats.mic = { sent: 0 };
     let micSession = null;
     mic.addEventListener("click", () => {
-      if (micSession) { micSession.stop(); micSession = null; showMic("🎙️", "Microphone: off (click to send your microphone to the desktop)", false); }
+      if (micSession) { micSession.stop(); micSession = null; showMic("off", "Microphone: off (click to send your microphone to the desktop)"); }
       else micSession = startMic();
     });
 
     function startMic() {
       let ws, context, media, encoder, stopped = false, timestamp = 0;
-      showMic("⏳", "Microphone: starting…", false);
+      showMic("wait", "Microphone: starting…");
       const stop = () => {
         stopped = true;
         if (ws) ws.onclose = null, ws.close();
@@ -193,7 +264,7 @@
       };
       const fail = (err) => {
         console.warn("rtp-audio mic:", err);
-        showMic("⚠️", `Microphone: ${err.message || err} (click to retry)`, false);
+        showMic("warn", `Microphone: ${err.message || err} (click to retry)`);
         stop();
         micSession = null;
       };
@@ -235,7 +306,7 @@
             stats.mic.sent++;
           }
         };
-        ws.onopen = () => showMic("🎙️", `Microphone: on (${opus ? "Opus" : "PCM"}, click to turn off)`, true);
+        ws.onopen = () => showMic("on", `Microphone: on (${opus ? "Opus" : "PCM"}, click to turn off)`);
         ws.onclose = (event) => { if (!stopped) fail(event.reason || "the connection closed"); };
       })().catch(fail);
       return { stop };
