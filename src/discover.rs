@@ -48,9 +48,21 @@ fn parse_answer(data: &[u8], from: SocketAddr) -> Option<Found> {
 pub fn find(port: u16, wait: Duration) -> std::io::Result<Vec<Found>> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     socket.set_broadcast(true)?;
-    socket.send_to(QUESTION, (Ipv4Addr::BROADCAST, port))?;
-    // Also ask this computer itself, which a broadcast doesn't always reach.
-    let _ = socket.send_to(QUESTION, (Ipv4Addr::LOCALHOST, port));
+    // Some systems (macOS) refuse the general broadcast address, so also ask this network's own
+    // broadcast address (assuming the usual /24), and this computer itself, which a broadcast
+    // doesn't always reach. Only fail if nothing could be asked.
+    let mut asked = Vec::new();
+    let mut targets = vec![Ipv4Addr::BROADCAST, Ipv4Addr::LOCALHOST];
+    if let Some(ip) = local_ipv4() {
+        let [a, b, c, _] = ip.octets();
+        targets.insert(1, Ipv4Addr::new(a, b, c, 255));
+    }
+    for target in targets {
+        asked.push(socket.send_to(QUESTION, (target, port)));
+    }
+    if let Some(Err(err)) = asked.iter().find(|r| r.is_err()).filter(|_| asked.iter().all(Result::is_err)) {
+        return Err(std::io::Error::new(err.kind(), err.to_string()));
+    }
     let deadline = Instant::now() + wait;
     let mut found: Vec<Found> = Vec::new();
     let mut buf = [0u8; 512];
@@ -71,6 +83,17 @@ pub fn find(port: u16, wait: Duration) -> std::io::Result<Vec<Found>> {
         }
     }
     Ok(found)
+}
+
+/// This computer's address on its main network: the one a packet to the internet would come
+/// from (nothing is sent).
+fn local_ipv4() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
 }
 
 /// `rtp-audio find`.
