@@ -6,6 +6,8 @@ connection and behind the same login as the noVNC desktop, so it is safe to use 
 internet, unlike the plain UDP stream. Nothing needs to be installed on the computer you watch
 from.
 
+For a complete walk-through on a new server, see [install on a server](install.md).
+
 These steps follow the [secure VNC guide](https://gist.github.com/madtunebk/b1909ed9b0bf3826bb6056286b5e13bc):
 NGINX with HTTPS, and OauthRS protecting `location /` and `/websockify`.
 
@@ -81,11 +83,12 @@ sudo systemctl reload nginx
 
 ## 3. Listen
 
-Open the desktop in your browser as usual and log in. A 🔇 button sits in the bottom-right
-corner: click it to turn the sound on (🔊). Browsers only allow sound after a click, so it never
-starts by itself.
+Open the desktop in your browser as usual and log in. noVNC's control bar now has a speaker
+button: click it to turn the sound on. Browsers only allow sound after a click, so it never
+starts by itself. (On pages without noVNC's control bar, the buttons float in the bottom-right
+corner.)
 
-If the sender restarts, the player reconnects by itself (⏳). Without a login, `/audio/` answers
+If the sender restarts, the player reconnects by itself (the button shows three dots meanwhile). Without a login, `/audio/` answers
 `401`, so nobody can listen without an account.
 
 ## Your microphone, the other way
@@ -97,7 +100,7 @@ app running there:
 ./rtp-audio send --web 46080 --mic
 ```
 
-The page then shows a second button, 🎙️. Click it and allow the microphone: the desktop gets a
+The control bar then shows a microphone button as well. Click it and allow the microphone: the desktop gets a
 new input, **"RTP Audio Microphone"**, made the default while rtp-audio runs, so apps pick it up
 by themselves. Your browser cleans the sound up first (echo cancellation, noise suppression),
 compresses it to Opus (about 64 kbit/s) and sends it through the same HTTPS connection and

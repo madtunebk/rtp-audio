@@ -118,7 +118,7 @@ fn send_source(
         .or_else(|| wanted.parse().ok().and_then(|id: u32| sources.iter().find(|source| source.index == id)))
         .ok_or_else(|| format!("unknown source '{wanted}'; see `rtp-audio sources` for the names and IDs"))?;
     let _capture = Capture::start(pulse, &source.name, sinks, events)?;
-    eprintln!("Sending {} ({}) to {target}. Ctrl+C to stop.", source.description, source.name);
+    eprintln!("Sending {} ({}) to {target}. {}", source.description, source.name, stop_hint());
     wait(pulse, stop, target)
 }
 
@@ -144,16 +144,25 @@ fn send_all(
         let _capture = Capture::start(pulse, &monitor, sinks, events)?;
         fail_point("capture")?;
         eprintln!(
-            "Sending all sound to {target}: \"{DISPLAY_NAME}\" is now the default output{}.\n\
-             Ctrl+C to stop and switch sound back.",
+            "Sending all sound to {target}: \"{DISPLAY_NAME}\" is now the default output{}.\n{}",
             match moved {
                 0 => String::new(),
                 1 => " (1 playing stream moved to it)".into(),
                 n => format!(" ({n} playing streams moved to it)"),
-            }
+            },
+            stop_hint()
         );
         wait(pulse, stop, target)
     })()
+}
+
+/// How to stop: Ctrl+C in a terminal, or through the service.
+fn stop_hint() -> &'static str {
+    if super::service::is_service_process(std::process::id()) {
+        "Running as the rtp-audio service: `rtp-audio service stop` stops it and switches sound back."
+    } else {
+        "Ctrl+C to stop and switch sound back."
+    }
 }
 
 /// Stream until Ctrl+C, SIGTERM or an error.

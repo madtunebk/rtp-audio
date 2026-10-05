@@ -26,6 +26,7 @@ Download from [releases](https://github.com/madtunebk/rtp-audio/releases).
 ## Docs
 
 - [Setup](docs/setup.md): step by step, sending one source, all options
+- [Install on a server](docs/install.md): sound and microphone in the noVNC page, step by step
 - [Sound in the browser](docs/web.md): Opus over HTTPS, behind the login
 - [Troubleshooting](docs/troubleshooting.md)
 - [Building](docs/building.md): build, runtime requirements and limitations

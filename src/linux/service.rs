@@ -11,8 +11,9 @@ pub fn run(action: &str, send_args: &[String]) -> Result<(), Box<dyn Error>> {
     match action {
         "install" => install(send_args),
         "uninstall" => uninstall(),
-        "status" => systemctl(&["status", "--no-pager", UNIT]).map(|_| ()),
+        "status" => check_user_manager().and_then(|()| systemctl(&["status", "--no-pager", UNIT]).map(|_| ())),
         "start" | "stop" | "restart" => {
+            check_user_manager()?;
             systemctl(&[action, UNIT])?;
             eprintln!("rtp-audio service: {action} done");
             Ok(())
@@ -58,7 +59,26 @@ fn unit_file(exe: &str, send_args: &[String]) -> String {
     )
 }
 
+/// Is this user's service manager running? Without it (logged in through `su`/`sudo -u`, or
+/// no login session), `systemctl --user` has nothing to talk to.
+fn check_user_manager() -> Result<(), Box<dyn Error>> {
+    let uid = unsafe { libc::getuid() };
+    let bus = std::path::PathBuf::from(format!("/run/user/{uid}/bus"));
+    if bus.exists() {
+        return Ok(());
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "$USER".into());
+    Err(format!(
+        "your user's service manager is not running ({} does not exist), so services can't be managed.\n  \
+         Start it, and keep it running at boot, with:  sudo loginctl enable-linger {user}\n  \
+         Then log in over SSH as {user} directly (not with su or sudo -u) and try again.",
+        bus.display()
+    )
+    .into())
+}
+
 fn install(send_args: &[String]) -> Result<(), Box<dyn Error>> {
+    check_user_manager()?;
     let exe = std::env::current_exe()?;
     let exe = exe.to_str().ok_or("the path to rtp-audio is not valid UTF-8")?;
     let path = unit_path()?;
@@ -81,6 +101,7 @@ fn install(send_args: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 fn uninstall() -> Result<(), Box<dyn Error>> {
+    check_user_manager()?;
     let path = unit_path()?;
     if !path.exists() {
         return Err(format!("no rtp-audio service installed ({} does not exist)", path.display()).into());
