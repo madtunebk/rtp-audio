@@ -1,0 +1,77 @@
+# Builds rtp-audio for Linux and Windows and attaches the archives to a GitHub release.
+# Runs when a release is published; "Run workflow" on the Actions tab makes a test build
+# (downloadable from the run's page, nothing is attached).
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported Ubuntu, so the binary also runs on older glibc versions.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: rtp-audio
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: rtp-audio.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ github.event.release.tag_name || format('dev-{0}', github.sha) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpulse-dev libasound2-dev pkg-config
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --locked --release
+
+      - name: Package
+        shell: bash
+        run: |
+          name="rtp-audio-${VERSION}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/release/${{ matrix.binary }}" README.md "$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            archive="$name.zip"
+            7z a -bd "$archive" "$name" > /dev/null
+          else
+            archive="$name.tar.gz"
+            tar czf "$archive" "$name"
+          fi
+          sha256sum "$archive" > "$archive.sha256"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$VERSION" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+
+      - name: Keep as a build artifact (manual runs)
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
