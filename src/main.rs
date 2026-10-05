@@ -14,6 +14,7 @@ mod transport;
 mod web;
 
 use std::error::Error;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use cli::Command;
@@ -42,11 +43,14 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         Command::Devices => receive::list_devices(),
         Command::Keygen => {
             println!("{}", secure::generate()?);
-            eprintln!(
-                "Save it to a file on both computers, readable only by you, e.g.\n  \
-                 rtp-audio keygen > ~/.rtp-audio.key && chmod 600 ~/.rtp-audio.key\n\
-                 then use --key-file ~/.rtp-audio.key with send and the receiver."
-            );
+            // Only when the key went to the screen: `keygen > file` needs no advice.
+            if std::io::stdout().is_terminal() {
+                eprintln!(
+                    "Save it to a file on both computers, readable only by you, e.g.\n  \
+                     rtp-audio keygen > ~/.rtp-audio.key && chmod 600 ~/.rtp-audio.key\n\
+                     then use --key-file ~/.rtp-audio.key with send and the receiver."
+                );
+            }
             Ok(())
         }
         Command::Find(port) => discover::print_found(port),

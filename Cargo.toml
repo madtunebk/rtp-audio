@@ -1,6 +1,6 @@
 [package]
 name = "rtp-audio"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,7 @@ chacha20poly1305 = "0.11"
 cpal = "0.18.2"
 gethostname = "1"
 getrandom = "0.4"
+if-addrs = "0.15"
 opus = "0.4"
 socket2 = "0.6"
 

@@ -345,9 +345,28 @@ fn bind(port: u16, group: Option<Ipv4Addr>) -> std::io::Result<UdpSocket> {
     }
     socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
     if let Some(group) = group {
-        socket.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)?;
+        join_everywhere(&socket, group)?;
     }
     Ok(socket.into())
+}
+
+/// Join `group` on every IPv4 network this computer is on: joining with no interface uses only
+/// the default route's, so on a computer with several networks (Wi-Fi and cable, a VPN, virtual
+/// machines) the group's sound could arrive on another one and never be heard.
+fn join_everywhere(socket: &Socket, group: Ipv4Addr) -> std::io::Result<()> {
+    let mut joined = false;
+    for interface in if_addrs::get_if_addrs()? {
+        if let std::net::IpAddr::V4(address) = interface.ip()
+            && !interface.is_loopback()
+            && socket.join_multicast_v4(&group, &address).is_ok()
+        {
+            joined = true;
+        }
+    }
+    if !joined {
+        socket.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)?;
+    }
+    Ok(())
 }
 
 /// What the sound card callback needs.
