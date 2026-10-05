@@ -119,6 +119,7 @@ When rtp-audio stops, the default input is switched back, and the microphone rem
 - Troubleshooting: in the browser console, `rtpAudio` shows the frames received and decoded, the
   current level, and with the microphone on, `rtpAudio.mic.sent`.
 - The microphone needs HTTPS (browsers only allow it on secure pages), which NGINX provides.
-- Without NGINX, for a quick test through an SSH tunnel, open `http://127.0.0.1:46080/` directly.
-  Never serve on a public address without NGINX: the audio server itself has no login. It warns
+- The audio server has no page of its own, only the player script it adds to noVNC, so nobody can
+  open a second player next to the desktop and hear the sound twice.
+- Never serve on a public address without NGINX: the audio server itself has no login. It warns
   if you try.

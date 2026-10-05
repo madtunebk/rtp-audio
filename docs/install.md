@@ -41,9 +41,9 @@ Restarting closes any open desktop connection.
 ## 2. Install rtp-audio
 
 ```bash
-wget https://github.com/madtunebk/rtp-audio/releases/download/v0.2.2/rtp-audio-v0.2.2-x86_64-unknown-linux-gnu.tar.gz
-tar -xzf rtp-audio-v0.2.2-x86_64-unknown-linux-gnu.tar.gz
-sudo install -m 755 rtp-audio-v0.2.2-x86_64-unknown-linux-gnu/rtp-audio /usr/local/bin/rtp-audio
+wget https://github.com/madtunebk/rtp-audio/releases/download/v0.2.3/rtp-audio-v0.2.3-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf rtp-audio-v0.2.3-x86_64-unknown-linux-gnu.tar.gz
+sudo install -m 755 rtp-audio-v0.2.3-x86_64-unknown-linux-gnu/rtp-audio /usr/local/bin/rtp-audio
 ```
 
 On an ARM server (e.g. a Raspberry Pi), use the `aarch64-unknown-linux-gnu` archive. To upgrade

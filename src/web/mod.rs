@@ -31,9 +31,6 @@ const FRAME_SAMPLES: usize = RATE as usize / 50 * CHANNELS;
 const QUEUE: usize = 25;
 const BITRATE: i32 = 128_000;
 const PLAYER: &str = include_str!("player.js");
-const PAGE: &str = "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\">\
-    <title>rtp-audio</title><body style=\"background:#111;color:#ddd;font:16px sans-serif;padding:2em\">\
-    <p>rtp-audio: press the sound button in the corner.</p><script src=\"player.js\"></script>";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Codec {
@@ -242,7 +239,6 @@ fn serve(mut stream: TcpStream, hub: &Hub, mic: Option<&MicFeed>) -> Result<(), 
     let config = format!(r#"{{"mic":{}}}"#, mic.is_some());
     let (status, kind, body) = match path.split('?').next().unwrap_or("/") {
         "/player.js" => ("200 OK", "text/javascript; charset=utf-8", PLAYER),
-        "/" => ("200 OK", "text/html; charset=utf-8", PAGE),
         "/config.json" => ("200 OK", "application/json", config.as_str()),
         _ => ("404 Not Found", "text/plain; charset=utf-8", "not found\n"),
     };
