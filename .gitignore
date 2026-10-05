@@ -1,1 +1,8 @@
 /target
+
+# Built binaries and packaged releases: these belong on GitHub releases, not in git.
+*.exe
+*.tar.gz
+*.zip
+*.sha256
+/rtp-audio-*/
