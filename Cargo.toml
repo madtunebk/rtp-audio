@@ -13,4 +13,6 @@ strip = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 libpulse-binding = "2.30"
+opus = "0.4"
 signal-hook = "0.4"
+tungstenite = "0.30"

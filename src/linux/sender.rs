@@ -12,7 +12,8 @@ use super::capture::{self, Capture};
 use super::pulse::Pulse;
 use super::routing::{self, DISPLAY_NAME, Routing};
 use super::{Event, fail_point, lock};
-use crate::transport::RtpSender;
+use crate::transport::{AudioSink, RtpSender};
+use crate::web;
 
 /// Ctrl+C (or SIGTERM) arrived before streaming started.
 #[derive(Debug)]
@@ -26,10 +27,28 @@ impl fmt::Display for Interrupted {
 
 impl Error for Interrupted {}
 
-pub fn run(destination: SocketAddr, source: Option<&str>) -> Result<(), Box<dyn Error>> {
-    // Fail on a bad network before touching any sound settings.
-    let rtp = RtpSender::connect(destination, capture::RATE, capture::CHANNELS.into())
-        .map_err(|err| format!("cannot send to {destination}: {err}"))?;
+/// Send to a receiver at `destination`, to browsers through a server on `web`, or both.
+pub fn run(destination: Option<SocketAddr>, source: Option<&str>, web: Option<SocketAddr>) -> Result<(), Box<dyn Error>> {
+    // Fail on a bad network or a busy port before touching any sound settings.
+    let mut sinks: Vec<Box<dyn AudioSink>> = Vec::new();
+    let mut targets = Vec::new();
+    if let Some(destination) = destination {
+        let rtp = RtpSender::connect(destination, capture::RATE, capture::CHANNELS.into())
+            .map_err(|err| format!("cannot send to {destination}: {err}"))?;
+        sinks.push(Box::new(rtp));
+        targets.push(destination.to_string());
+    }
+    if let Some(address) = web {
+        sinks.push(Box::new(web::start(address)?));
+        targets.push(format!("browsers (http://{address})"));
+        if !address.ip().is_loopback() {
+            eprintln!(
+                "Warning: anyone who can reach {address} can listen, without logging in.\n  \
+                 Use 127.0.0.1 and put it behind NGINX's HTTPS and login (see docs/web.md)."
+            );
+        }
+    }
+    let target = targets.join(" and ");
     // From here on, Ctrl+C and SIGTERM only ask for an orderly stop.
     let (events, stop) = mpsc::channel();
     watch_signals(events.clone())?;
@@ -40,8 +59,8 @@ pub fn run(destination: SocketAddr, source: Option<&str>) -> Result<(), Box<dyn 
     check_interrupted(&stop)?;
 
     let result = match source {
-        Some(source) => send_source(&pulse, source, rtp, events, &stop, destination),
-        None => send_all(&pulse, state, rtp, events, &stop, destination),
+        Some(source) => send_source(&pulse, source, sinks, events, &stop, &target),
+        None => send_all(&pulse, state, sinks, events, &stop, &target),
     };
     match result {
         Err(err) if err.is::<Interrupted>() => Ok(()),
@@ -53,10 +72,10 @@ pub fn run(destination: SocketAddr, source: Option<&str>) -> Result<(), Box<dyn 
 fn send_source(
     pulse: &Pulse,
     wanted: &str,
-    rtp: RtpSender,
+    sinks: Vec<Box<dyn AudioSink>>,
     events: Sender<Event>,
     stop: &Receiver<Event>,
-    destination: SocketAddr,
+    target: &str,
 ) -> Result<(), Box<dyn Error>> {
     let sources = pulse.sources()?;
     let source = sources
@@ -64,19 +83,19 @@ fn send_source(
         .find(|source| source.name == wanted)
         .or_else(|| wanted.parse().ok().and_then(|id: u32| sources.iter().find(|source| source.index == id)))
         .ok_or_else(|| format!("unknown source '{wanted}'; see `rtp-audio sources` for the names and IDs"))?;
-    let _capture = Capture::start(pulse, &source.name, rtp, events)?;
-    eprintln!("Sending {} ({}) to {destination}. Ctrl+C to stop.", source.description, source.name);
-    wait(pulse, stop, destination)
+    let _capture = Capture::start(pulse, &source.name, sinks, events)?;
+    eprintln!("Sending {} ({}) to {target}. Ctrl+C to stop.", source.description, source.name);
+    wait(pulse, stop, target)
 }
 
 /// Automatic mode: everything this computer plays goes to the "RTP Audio" output, which we send.
 fn send_all(
     pulse: &Pulse,
     state: std::path::PathBuf,
-    rtp: RtpSender,
+    sinks: Vec<Box<dyn AudioSink>>,
     events: Sender<Event>,
     stop: &Receiver<Event>,
-    destination: SocketAddr,
+    target: &str,
 ) -> Result<(), Box<dyn Error>> {
     let mut routing = Routing::new(pulse, state);
     let result = (|| {
@@ -89,10 +108,10 @@ fn send_all(
         let moved = routing.move_streams()?;
         fail_point("move")?;
         check_interrupted(stop)?;
-        let _capture = Capture::start(pulse, &monitor, rtp, events)?;
+        let _capture = Capture::start(pulse, &monitor, sinks, events)?;
         fail_point("capture")?;
         eprintln!(
-            "Sending all sound to {destination}: \"{DISPLAY_NAME}\" is now the default output{}.\n\
+            "Sending all sound to {target}: \"{DISPLAY_NAME}\" is now the default output{}.\n\
              Ctrl+C to stop and switch sound back.",
             match moved {
                 0 => String::new(),
@@ -100,7 +119,7 @@ fn send_all(
                 n => format!(" ({n} playing streams moved to it)"),
             }
         );
-        wait(pulse, stop, destination)
+        wait(pulse, stop, target)
     })();
     // Runs whatever happened above, including a failure halfway through starting.
     routing.restore();
@@ -108,13 +127,13 @@ fn send_all(
 }
 
 /// Stream until Ctrl+C, SIGTERM or an error.
-fn wait(pulse: &Pulse, stop: &Receiver<Event>, destination: SocketAddr) -> Result<(), Box<dyn Error>> {
+fn wait(pulse: &Pulse, stop: &Receiver<Event>, target: &str) -> Result<(), Box<dyn Error>> {
     match stop.recv() {
         Ok(Event::Signal) | Err(_) => {
             eprintln!("Stopping");
             Ok(())
         }
-        Ok(Event::Network(err)) => Err(format!("sending to {destination} failed: {err}").into()),
+        Ok(Event::Network(err)) => Err(format!("sending to {target} failed: {err}").into()),
         Ok(Event::Capture(_)) if !pulse.is_connected() => Err("the connection to the sound server was lost".into()),
         Ok(Event::Capture(err)) => Err(format!("{err} (was the source removed?)").into()),
     }

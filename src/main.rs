@@ -8,6 +8,8 @@ mod linux;
 mod receive;
 mod rtp;
 mod transport;
+#[cfg(target_os = "linux")]
+mod web;
 
 use std::error::Error;
 use std::process::ExitCode;
@@ -32,12 +34,13 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         }
         Command::Receive(options) => receive::run(options),
         Command::Send(options) if options.stdin => {
-            transport::send_stdin(options.destination, options.rate, options.channels)
+            let destination = options.destination.ok_or("--stdin needs the receiver's address")?;
+            transport::send_stdin(destination, options.rate, options.channels)
         }
         #[cfg(target_os = "linux")]
         Command::Sources => linux::list_sources(),
         #[cfg(target_os = "linux")]
-        Command::Send(options) => linux::sender::run(options.destination, options.source.as_deref()),
+        Command::Send(options) => linux::sender::run(options.destination, options.source.as_deref(), options.web),
         #[cfg(not(target_os = "linux"))]
         Command::Sources | Command::Send(_) => {
             Err("capturing sound is only supported on Linux; here, pipe raw audio into `send HOST:PORT --stdin`".into())

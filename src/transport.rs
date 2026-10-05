@@ -10,6 +10,18 @@ use crate::rtp;
 /// 5 ms of audio per packet: small enough for low latency, ~1 KB so it never fragments.
 const PACKET_MS: u32 = 5;
 
+/// Somewhere captured sound goes: raw big-endian 16-bit PCM, 48 kHz stereo.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub trait AudioSink {
+    fn push(&mut self, pcm: &[u8]) -> std::io::Result<()>;
+}
+
+impl AudioSink for RtpSender {
+    fn push(&mut self, pcm: &[u8]) -> std::io::Result<()> {
+        RtpSender::push(self, pcm)
+    }
+}
+
 pub struct RtpSender {
     socket: UdpSocket,
     ssrc: u32,

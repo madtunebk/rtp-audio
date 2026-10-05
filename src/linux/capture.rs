@@ -1,4 +1,4 @@
-//! Recording a source through libpulse and handing the audio straight to the RTP sender.
+//! Recording a source through libpulse and handing the audio straight to the senders.
 
 use std::error::Error;
 use std::sync::mpsc::Sender;
@@ -10,7 +10,7 @@ use pa::stream::{FlagSet, PeekResult, State, Stream};
 
 use super::Event;
 use super::pulse::Pulse;
-use crate::transport::RtpSender;
+use crate::transport::AudioSink;
 
 /// What the receiver expects: 48 kHz stereo, big-endian 16-bit (RTP L16).
 pub const RATE: u32 = 48_000;
@@ -24,9 +24,14 @@ pub struct Capture<'a> {
 }
 
 impl<'a> Capture<'a> {
-    /// Start recording `source`, sending everything to `rtp`. Problems once running arrive as
-    /// `Event`s.
-    pub fn start(pulse: &'a Pulse, source: &str, mut rtp: RtpSender, events: Sender<Event>) -> Result<Self, Box<dyn Error>> {
+    /// Start recording `source`, handing everything to each sink. Problems once running arrive
+    /// as `Event`s.
+    pub fn start(
+        pulse: &'a Pulse,
+        source: &str,
+        mut sinks: Vec<Box<dyn AudioSink>>,
+        events: Sender<Event>,
+    ) -> Result<Self, Box<dyn Error>> {
         let spec = Spec { format: Format::S16be, rate: RATE, channels: CHANNELS };
         let attr = BufferAttr {
             maxlength: u32::MAX,
@@ -51,9 +56,11 @@ impl<'a> Capture<'a> {
                         Ok(PeekResult::Empty) => break,
                         Ok(PeekResult::Hole(_)) => {}
                         Ok(PeekResult::Data(data)) => {
-                            if !failed && let Err(err) = rtp.push(data) {
-                                failed = true;
-                                let _ = read_events.send(Event::Network(err));
+                            for sink in &mut sinks {
+                                if !failed && let Err(err) = sink.push(data) {
+                                    failed = true;
+                                    let _ = read_events.send(Event::Network(err));
+                                }
                             }
                         }
                         Err(err) => {

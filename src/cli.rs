@@ -15,6 +15,9 @@ usage:
       default and moves playing apps to it; Ctrl+C switches everything back
   rtp-audio send HOST:PORT --source NAME_OR_ID
       send one source from `rtp-audio sources` instead, without changing any output
+  rtp-audio send --web 127.0.0.1:46080 [HOST:PORT] [--source NAME_OR_ID]
+      (also) serve the sound to web browsers, as Opus over a WebSocket, with a player page;
+      put it behind NGINX for HTTPS and a login (see docs/web.md)
   rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]
       send raw big-endian 16-bit PCM read from stdin
 
@@ -28,7 +31,9 @@ pub enum Command {
 }
 
 pub struct SendOptions {
-    pub destination: SocketAddr,
+    pub destination: Option<SocketAddr>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub web: Option<SocketAddr>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub source: Option<String>,
     pub stdin: bool,
@@ -40,7 +45,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
     let mut command: Option<String> = None;
     let mut positional = Vec::new();
     let (mut port, mut latency_ms, mut rate, mut channels) = (None, None, None, None);
-    let (mut source, mut stdin) = (None, false);
+    let (mut source, mut stdin, mut web) = (None, false, None);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
@@ -52,6 +57,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             "--channels" => channels = Some(number::<usize>(&arg, &value()?)?),
             "-s" | "--source" => source = Some(value()?),
             "--stdin" => stdin = true,
+            "--web" => web = Some(value()?),
             _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'\n\n{USAGE}")),
             "receive" | "send" | "sources" if command.is_none() => command = Some(arg),
             _ => positional.push(arg),
@@ -68,6 +74,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             ("--channels", channels.is_some()),
             ("--source", source.is_some()),
             ("--stdin", stdin),
+            ("--web", web.is_some()),
         ];
         match given.iter().find(|(name, set)| *set && !allowed.contains(name)) {
             Some((name, _)) => Err(format!("{name} can't be used here\n\n{USAGE}")),
@@ -86,22 +93,29 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
         }
         Some("send") => {
             let mut positional = positional.into_iter();
-            let destination = positional
-                .next()
-                .ok_or(format!("send needs the receiver's address, e.g. rtp-audio send 192.168.1.20:46000\n\n{USAGE}"))?;
+            let destination = positional.next();
             if let Some(arg) = positional.next() {
                 return Err(extra(&arg));
             }
+            if destination.is_none() && web.is_none() {
+                return Err(format!(
+                    "send needs the receiver's address (e.g. rtp-audio send 192.168.1.20:46000) or --web\n\n{USAGE}"
+                ));
+            }
             if stdin {
                 only(&["--stdin", "--rate", "--channels"])?;
+                if destination.is_none() {
+                    return Err("--stdin needs the receiver's address".into());
+                }
             } else {
-                only(&["--source"])?;
+                only(&["--source", "--web"])?;
             }
             if source.as_deref().is_some_and(|s| s.trim().is_empty()) {
                 return Err("--source needs a source name or ID (see rtp-audio sources)".into());
             }
             Ok(Command::Send(SendOptions {
-                destination: parse_destination(&destination)?,
+                destination: destination.as_deref().map(parse_destination).transpose()?,
+                web: web.as_deref().map(parse_web).transpose()?,
                 source,
                 stdin,
                 rate: nonzero("--rate", rate.unwrap_or(48_000))?,
@@ -129,6 +143,14 @@ fn number<T: std::str::FromStr>(option: &str, text: &str) -> Result<T, String> {
 
 fn nonzero<T: Default + PartialEq>(option: &str, value: T) -> Result<T, String> {
     if value == T::default() { Err(format!("{option} must be above 0")) } else { Ok(value) }
+}
+
+/// Where to serve browsers: `IP:PORT`, or just `PORT` for 127.0.0.1.
+fn parse_web(text: &str) -> Result<SocketAddr, String> {
+    if let Ok(port) = text.parse::<u16>() {
+        return if port == 0 { Err("--web: port must be 1-65535".into()) } else { Ok(SocketAddr::from(([127, 0, 0, 1], port))) };
+    }
+    parse_destination(text).map_err(|err| format!("--web: {err}"))
 }
 
 /// `HOST:PORT`, `IP:PORT` or `[IPv6]:PORT`, resolved to an address.
@@ -191,6 +213,10 @@ mod tests {
         assert!(matches!(parse(args("send 10.0.0.2:46000 --help")), Ok(Command::Help)));
         let Ok(Command::Send(send)) = parse(args("send 10.0.0.2:46000 --source 48")) else { panic!() };
         assert_eq!((send.source.as_deref(), send.stdin), (Some("48"), false));
+        let Ok(Command::Send(send)) = parse(args("send --web 46080")) else { panic!() };
+        assert_eq!((send.destination, send.web.map(|a| a.to_string())), (None, Some("127.0.0.1:46080".into())));
+        let Ok(Command::Send(send)) = parse(args("send 10.0.0.2:46000 --web 127.0.0.1:46080")) else { panic!() };
+        assert!(send.destination.is_some() && send.web.is_some());
         assert!(matches!(parse(args("send 10.0.0.2:46000 --stdin --rate 44100")), Ok(Command::Send(s)) if s.rate == 44100));
     }
 
@@ -203,6 +229,10 @@ mod tests {
             "send 10.0.0.2:46000 --rate 44100",
             "send 10.0.0.2:46000 --stdin --source 1",
             "send 10.0.0.2:46000 --source",
+            "send --web",
+            "send --web 0",
+            "send --stdin --web 46080",
+            "send 10.0.0.2:46000 --stdin --web 46080",
             "sources --port 1",
             "--port 0",
             "--port 99999",

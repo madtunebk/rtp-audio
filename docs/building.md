@@ -1,7 +1,7 @@
 # Building
 
 ```bash
-sudo apt install libpulse-dev libasound2-dev pkg-config   # Debian/Ubuntu build dependencies
+sudo apt install libpulse-dev libasound2-dev pkg-config cmake   # Debian/Ubuntu build dependencies
 cargo build --release                                     # this machine: target/release/rtp-audio
 cargo test
 ```
@@ -18,6 +18,8 @@ cargo build --release --target x86_64-pc-windows-gnu
 - The Linux binary links `libpulse.so.0` (`libpulse0` / `pulseaudio-libs`) and `libasound.so.2`
   (`libasound2` / `alsa-lib`) dynamically; both ship with nearly every desktop. It runs no other
   programs: no `pactl`, `parec` or shell scripts.
+- Opus (for the browser mode) is compiled into the binary from source, which is why building
+  needs `cmake`; running needs no Opus library.
 - The sender talks the PulseAudio protocol: it works with PulseAudio, and with PipeWire through
   `pipewire-pulse`. It never starts a sound server, installs anything or needs `sudo`.
 - Capturing works on Linux only. The Windows build receives, and can `send --stdin`.
