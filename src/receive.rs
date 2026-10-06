@@ -205,14 +205,51 @@ struct Outlet {
     device: cpal::Device,
 }
 
-/// The outputs, each name once (ALSA lists every card under several names: hw, plughw, …).
+/// The outputs, each real one once. ALSA lists every card port under several names (hw:,
+/// plughw:, hdmi:, dmix:, sysdefault:, …): a card's hw: ports are kept, one per port even when
+/// two share a name (two HDMI ports to the same model of monitor), and its other aliases are left
+/// out. Outputs that aren't a card (PipeWire, default) and those of other systems are kept, each
+/// ID once.
 fn outputs() -> Result<Vec<Outlet>, Box<dyn Error>> {
-    let mut seen = std::collections::HashSet::new();
-    Ok(cpal::default_host()
+    let all: Vec<Outlet> = cpal::default_host()
         .output_devices()?
         .map(|device| Outlet { name: device_name(&device), id: device_id(&device), device })
-        .filter(|outlet| seen.insert(outlet.name.clone()))
+        .collect();
+    let hw_cards: std::collections::HashSet<String> =
+        all.iter().filter_map(|o| alsa_port(&o.id)).filter(|port| port.plugin == "hw").map(|port| port.card).collect();
+    let mut seen = std::collections::HashSet::new();
+    Ok(all
+        .into_iter()
+        .filter(|o| match alsa_port(&o.id) {
+            // A card's port once: hw:CARD=NVidia,DEV=3 and hw:CARD=1,DEV=3 are the same one.
+            Some(port) => {
+                (port.plugin == "hw" || !hw_cards.contains(&port.card)) && seen.insert(format!("{}:{}:{}", port.plugin, port.card, port.dev))
+            }
+            // Without an ID there's no telling two apart: keep them all.
+            None => o.id.is_empty() || seen.insert(o.id.clone()),
+        })
         .collect())
+}
+
+/// An ALSA card port, from an ID like alsa:hw:CARD=NVidia,DEV=3.
+struct AlsaPort {
+    plugin: String,
+    /// The card's name; a card given by number (CARD=1) is looked up, so both spellings match.
+    card: String,
+    dev: String,
+}
+
+fn alsa_port(id: &str) -> Option<AlsaPort> {
+    let rest = id.strip_prefix("alsa:")?;
+    let (plugin, args) = rest.split_once(':')?;
+    let field = |name: &str| args.split(',').find_map(|arg| arg.strip_prefix(name)).map(str::to_string);
+    let mut card = field("CARD=")?;
+    if card.chars().all(|c| c.is_ascii_digit())
+        && let Ok(name) = std::fs::read_to_string(format!("/proc/asound/card{card}/id"))
+    {
+        card = name.trim().to_string();
+    }
+    Some(AlsaPort { plugin: plugin.to_string(), card, dev: field("DEV=").unwrap_or_default() })
 }
 
 /// `rtp-audio devices`: the sound outputs this computer can play on.
@@ -236,8 +273,20 @@ fn pick_device(wanted: Option<&str>) -> Result<cpal::Device, Box<dyn Error>> {
     };
     let mut outputs = outputs()?;
     let lower = wanted.to_lowercase();
-    if let Some(i) = outputs.iter().position(|o| o.id == wanted || o.name.to_lowercase() == lower) {
+    if let Some(i) = outputs.iter().position(|o| o.id == wanted) {
         return Ok(outputs.swap_remove(i).device);
+    }
+    let named: Vec<usize> = (0..outputs.len()).filter(|&i| outputs[i].name.to_lowercase() == lower).collect();
+    match named.as_slice() {
+        [i] => return Ok(outputs.swap_remove(*i).device),
+        [] => {}
+        _ => {
+            return Err(format!(
+                "several outputs are called '{wanted}': choose one by its ID ({})",
+                named.iter().map(|&i| outputs[i].id.as_str()).collect::<Vec<_>>().join(", ")
+            )
+            .into());
+        }
     }
     let matches: Vec<usize> = (0..outputs.len()).filter(|&i| outputs[i].name.to_lowercase().contains(&lower)).collect();
     match matches.as_slice() {
@@ -260,9 +309,24 @@ fn pick_devices(wanted: &[String]) -> Result<Vec<cpal::Device>, Box<dyn Error>> 
         return Ok(vec![pick_device(None)?]);
     }
     let outputs = outputs()?;
-    let exact = |text: &str| outputs.iter().position(|o| o.id == text || o.name.eq_ignore_ascii_case(text));
+    // An exact ID, or a name only one output has (a shared name is left to pick_device, which
+    // asks for the ID).
+    let exact = |text: &str| {
+        outputs.iter().position(|o| o.id == text).or_else(|| {
+            let mut named = outputs.iter().enumerate().filter(|(_, o)| o.name.eq_ignore_ascii_case(text));
+            match (named.next(), named.next()) {
+                (Some((i, _)), None) => Some(i),
+                _ => None,
+            }
+        })
+    };
     let mut devices = Vec::new();
     for value in wanted {
+        // A name several outputs share, given whole: ask which one (by ID) rather than read it as
+        // a list.
+        if outputs.iter().filter(|o| o.name.eq_ignore_ascii_case(value.trim())).count() > 1 {
+            pick_device(Some(value.trim()))?;
+        }
         let parts: Vec<&str> = value.split(',').collect();
         let mut i = 0;
         while i < parts.len() {
@@ -289,6 +353,34 @@ fn pick_devices(wanted: &[String]) -> Result<Vec<cpal::Device>, Box<dyn Error>> 
         return Err("--device names no output; see `rtp-audio devices`".into());
     }
     Ok(devices)
+}
+
+/// How much each sound card asks for at a time: 10 ms. Left to itself, ALSA can pick seconds for
+/// a card opened directly (hw:), which the jitter buffer can't keep level with.
+const CARD_PERIOD_MS: u32 = 10;
+
+/// Start playing on `device`; returns the stream and a description of it.
+fn open_output(device: &cpal::Device, out: Output) -> Result<(cpal::Stream, String), Box<dyn Error>> {
+    let supported = device.default_output_config()?;
+    let format = supported.sample_format();
+    let buffer_size = match supported.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            cpal::BufferSize::Fixed((supported.sample_rate() * CARD_PERIOD_MS / 1000).clamp(*min, *max))
+        }
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+    };
+    let mut config: StreamConfig = supported.into();
+    config.buffer_size = buffer_size;
+    let stream = match format {
+        SampleFormat::F32 => play::<f32>(device, &config, out),
+        SampleFormat::I16 => play::<i16>(device, &config, out),
+        SampleFormat::U16 => play::<u16>(device, &config, out),
+        SampleFormat::I32 => play::<i32>(device, &config, out),
+        SampleFormat::F64 => play::<f64>(device, &config, out),
+        other => return Err(format!("sample format {other} is not supported").into()),
+    }?;
+    stream.play()?;
+    Ok((stream, format!("{} ({} Hz, {} ch, {format})", device_name(device), config.sample_rate, config.channels)))
 }
 
 /// The jitter buffers of all the outputs: every frame goes into each.
@@ -341,24 +433,28 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let peak = Arc::new(AtomicU32::new(0));
     // One buffer per output: each sound card runs on its own clock, so each keeps its own level.
     let (mut buffers, mut streams, mut cards) = (Vec::new(), Vec::new(), Vec::new());
-    for device in pick_devices(&options.devices)? {
-        let supported = device.default_output_config()?;
-        let format = supported.sample_format();
-        let config: StreamConfig = supported.into();
+    let devices = pick_devices(&options.devices)?;
+    let several = devices.len() > 1;
+    let mut first_error = None;
+    for device in devices {
         let jitter = Arc::new(Mutex::new(Jitter::new(target)));
         let out = Output { jitter: Arc::clone(&jitter), peak: Arc::clone(&peak), volume: options.volume, input_rate: options.rate };
-        let stream = match format {
-            SampleFormat::F32 => play::<f32>(&device, &config, out),
-            SampleFormat::I16 => play::<i16>(&device, &config, out),
-            SampleFormat::U16 => play::<u16>(&device, &config, out),
-            SampleFormat::I32 => play::<i32>(&device, &config, out),
-            SampleFormat::F64 => play::<f64>(&device, &config, out),
-            other => return Err(format!("{}: sample format {other} is not supported", device_name(&device)).into()),
-        }?;
-        stream.play()?;
-        cards.push(format!("{} ({} Hz, {} ch, {format})", device_name(&device), config.sample_rate, config.channels));
-        buffers.push(jitter);
-        streams.push(stream);
+        match open_output(&device, out) {
+            Ok((stream, card)) => {
+                cards.push(card);
+                buffers.push(jitter);
+                streams.push(stream);
+            }
+            // With several outputs, one that won't open is skipped: the others still play.
+            Err(err) if several => {
+                eprintln!("Skipping {}: {err}", device_name(&device));
+                first_error.get_or_insert(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if streams.is_empty() {
+        return Err(first_error.unwrap_or_else(|| "no output could be opened".into()));
     }
     let card = if cards.len() == 1 { format!("sound card: {}", cards[0]) } else { format!("{} sound cards: {}", cards.len(), cards.join("; ")) };
     let jitter = Buffers(buffers);
@@ -889,3 +985,4 @@ mod tests {
         assert!(super::WsTarget::parse("ws://[::1").is_err());
     }
 }
+
