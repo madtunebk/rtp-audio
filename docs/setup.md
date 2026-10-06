@@ -104,6 +104,36 @@ can join (the group stays on the local network):
 rtp-audio --group 239.255.46.1                              # …on every receiver that wants it
 ```
 
+## Over TCP: through an SSH tunnel, or when UDP struggles
+
+UDP is the default and the quickest: nothing waits for a lost packet. But it needs a direct path
+from the sender to the receiver, and on a busy link (e.g. alongside an RDP session that takes the
+bandwidth) packets get lost and the sound breaks up. The receiver can instead play the sender's
+web stream (`--web`), which is Opus over TCP:
+
+```bash
+./rtp-audio send --web 46080                     # on the desktop: listens on localhost only
+ssh -L 46080:localhost:46080 USER@DESKTOP        # on your computer: a tunnel to it, left open
+./rtp-audio ws://localhost:46080                 # on your computer, in another terminal
+```
+
+- Nothing is lost on the way, and it goes wherever SSH goes: no open ports, encrypted by SSH, and
+  the desktop needs nothing listening on its network.
+- When the network is slow, TCP waits instead of losing; the receiver then skips ahead so the
+  delay doesn't keep growing. Give it a bigger buffer if the sound breaks up: `--latency 150`.
+- It reconnects by itself when the sender restarts.
+- The same sender serves browsers and TCP receivers at once, and with a service
+  (`rtp-audio service install --web 46080`) it's always there.
+- `ws://` only for now: behind NGINX's HTTPS, use a tunnel too.
+
+| | UDP (default) | TCP (`ws://`) |
+|---|---|---|
+| A lost packet | gone; Opus hides the gap | sent again |
+| A busy network | the sound breaks up | it waits, then skips ahead |
+| Through SSH or a proxy | no | yes |
+| Several receivers, multicast, `find` | yes | each connects on its own |
+| Encryption | `--key-file` | the tunnel's |
+
 ## Run it automatically
 
 Instead of starting the sender by hand in an SSH session, install it as a user service. It
@@ -127,6 +157,7 @@ install command tells you when that's needed. No other part of rtp-audio runs ex
 ```
 rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME_OR_ID] [--volume 100]
                     [--key-file FILE] [--group 239.255.46.1] [--no-discovery]
+rtp-audio [receive] ws://HOST:PORT [--latency 60] [--device NAME_OR_ID] [--volume 100]   # over TCP
 rtp-audio find [--port 46000]                                     # receivers on this network
 rtp-audio devices                                                 # outputs for --device
 rtp-audio keygen                                                  # a key for --key / --key-file

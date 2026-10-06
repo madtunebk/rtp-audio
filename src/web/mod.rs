@@ -195,6 +195,8 @@ fn serve(mut stream: TcpStream, hub: &Hub, mic: Option<&MicFeed>) -> Result<(), 
 
     if upgrade && (path == "/ws" || path.starts_with("/ws?")) {
         let codec = if path.contains("codec=pcm") { Codec::Pcm } else { Codec::Opus };
+        // Frames are small and every 20 ms: send each at once rather than gathering them.
+        stream.set_nodelay(true)?;
         let mut socket = tungstenite::accept(stream)?;
         socket.get_mut().set_read_timeout(None)?;
         let name = if codec == Codec::Opus { "opus" } else { "pcm" };

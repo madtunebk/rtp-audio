@@ -1,6 +1,6 @@
 [package]
 name = "rtp-audio"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -11,6 +11,7 @@ getrandom = "0.4"
 if-addrs = "0.15"
 opus = "0.4"
 socket2 = "0.6"
+tungstenite = "0.30"
 
 [profile.release]
 strip = true
@@ -19,4 +20,3 @@ strip = true
 libc = "0.2"
 libpulse-binding = "2.30"
 signal-hook = "0.4"
-tungstenite = "0.30"

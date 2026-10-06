@@ -15,5 +15,12 @@ lost packets become silence. The sound card pulls from it through a small resamp
 plays up to 0.5% faster or slower to keep the buffer level, since the sender's and the sound
 card's clocks never run at exactly the same speed.
 
+Given a `ws://` URL instead, the receiver connects to the sender's web stream (`--web`): a
+WebSocket over TCP, first a short header (codec, rate, channels), then one Opus frame per 20 ms.
+It decodes them into the same jitter buffer. TCP never loses a frame, but on a slow link they
+arrive late and in bursts; the buffer then drops the oldest sound so the delay stays near the
+buffer size. The sender encodes once for every browser and TCP receiver, and gives each a short
+queue, so one slow listener misses frames without holding back the others.
+
 It also plays standard RTP L16 streams (PulseAudio `module-rtp-send`, PipeWire `module-rtp-sink`,
 `ffmpeg -f rtp -acodec pcm_s16be`) at 48 kHz stereo.

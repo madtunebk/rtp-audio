@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::io::{ErrorKind, IsTerminal, Write};
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
 use socket2::{Domain, Protocol, Socket, Type};
+use tungstenite::Message;
 
 use crate::discover;
 use crate::jitter::{Jitter, Player, Stats};
@@ -30,6 +31,8 @@ pub struct Options {
     pub group: Option<Ipv4Addr>,
     /// Answer `rtp-audio find`.
     pub discovery: bool,
+    /// Play the sender's WebSocket stream (ws://…) instead of listening for UDP.
+    pub url: Option<String>,
 }
 
 /// Turns arriving packets (L16, Opus, or encrypted) into big-endian PCM for the jitter buffer.
@@ -181,7 +184,8 @@ fn pick_device(wanted: Option<&str>) -> Result<cpal::Device, Box<dyn Error>> {
     }
 }
 
-/// Receive RTP audio on a UDP port and play it on a sound card until killed.
+/// Receive RTP audio on a UDP port, or the sender's WebSocket stream, and play it on a sound
+/// card until killed.
 pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let device = pick_device(options.device.as_deref())?;
     let supported = device.default_output_config()?;
@@ -203,21 +207,31 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     }?;
     stream.play()?;
 
-    let socket = bind(options.port, options.group)?;
-    println!(
-        "Listening on UDP port {} ({} Hz, {} ch, {} ms buffer); sound card: {} ({} Hz, {} ch, {format})",
-        options.port, options.rate, options.channels, options.latency_ms, device_name(&device), config.sample_rate, config.channels
-    );
+    let card = format!("sound card: {} ({} Hz, {} ch, {format})", device_name(&device), config.sample_rate, config.channels);
+    let mut monitor = Monitor::new(options.rate);
+    match &options.url {
+        Some(url) => receive_websocket(url, &options, &card, &jitter, &peak, &mut monitor),
+        None => receive_udp(&options, &card, &jitter, &peak, &mut monitor),
+    }
+}
+
+fn print_volume_and_quit(options: &Options) {
     if options.volume != 1.0 {
         println!("Volume: {:.0}%", options.volume * 100.0);
     }
     println!("Ctrl+C to quit.");
+}
 
-    // At a terminal, one status line updates in place; in a log, only events and problems.
-    let live = std::io::stdout().is_terminal();
+/// RTP packets on a UDP port: plain, Opus or encrypted, from one sender or a multicast group.
+fn receive_udp(options: &Options, card: &str, jitter: &Mutex<Jitter>, peak: &AtomicU32, monitor: &mut Monitor) -> Result<(), Box<dyn Error>> {
+    let socket = bind(options.port, options.group)?;
+    println!(
+        "Listening on UDP port {} ({} Hz, {} ch, {} ms buffer); {card}",
+        options.port, options.rate, options.channels, options.latency_ms
+    );
+    print_volume_and_quit(options);
     socket.set_read_timeout(Some(STATUS_EVERY))?;
     let mut buf = [0u8; 65536];
-    let mut sender: Option<SocketAddr> = None;
     let mut unpacker = Unpacker { key: options.key.clone(), replay: ReplayWindow::default(), decoder: None, channels: options.channels, last_opus: None, opus_frame: 960, warned: None };
     if options.key.is_some() {
         println!("Only accepting sound encrypted with the key.");
@@ -225,10 +239,6 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     if let Some(group) = options.group {
         println!("Also listening to multicast group {group}.");
     }
-    let mut last_report = Instant::now();
-    let mut reported = Stats::default();
-    let (mut last_status, mut packets, mut shown) = (Instant::now(), 0u32, Stats::default());
-    let (mut last_packet, mut silent_reported) = (Instant::now(), true);
     loop {
         match socket.recv_from(&mut buf) {
             Ok((len, from)) => {
@@ -243,17 +253,10 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
                 if frames.is_empty() {
                     continue;
                 }
-                packets += 1;
-                last_packet = Instant::now();
-                silent_reported = false;
-                if sender != Some(from) {
-                    if live {
-                        print!("\r{:width$}\r", "", width = STATUS_WIDTH);
-                    }
+                monitor.arrived(&from.to_string(), || {
                     let codec = if unpacker.last_opus.is_some_and(|(ssrc, _)| ssrc == packet.ssrc) { "Opus" } else { "L16" };
-                    println!("Receiving from {from} ({codec}, {})", if encrypted { "encrypted" } else { "not encrypted" });
-                    sender = Some(from);
-                }
+                    format!("{codec}, {}", if encrypted { "encrypted" } else { "not encrypted" })
+                });
                 let mut jitter = jitter.lock().unwrap();
                 for (sequence, pcm) in &frames {
                     jitter.push(*sequence, pcm, options.channels);
@@ -262,29 +265,204 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(err) => return Err(err.into()),
         }
+        monitor.tick(jitter, peak);
+    }
+}
+
+/// How long to wait before connecting again after the sender's stream ends or can't be reached.
+const RECONNECT_EVERY: Duration = Duration::from_secs(2);
+
+/// The sender's WebSocket stream (`rtp-audio send --web`): Opus over TCP, so nothing is lost
+/// and it goes through an SSH tunnel or a proxy; it reconnects by itself when the sender restarts.
+fn receive_websocket(url: &str, options: &Options, card: &str, jitter: &Mutex<Jitter>, peak: &AtomicU32, monitor: &mut Monitor) -> Result<(), Box<dyn Error>> {
+    let target = WsTarget::parse(url)?;
+    println!("Receiving from {url} over TCP ({} ms buffer); {card}", options.latency_ms);
+    print_volume_and_quit(options);
+    let mut last_problem = String::new();
+    // Frame numbers for the jitter buffer, carried across reconnections: starting again from 0
+    // would look like old, late sound to it.
+    let mut sequence: u16 = 0;
+    loop {
+        let problem = match websocket_session(&target, options, jitter, peak, monitor, &mut sequence) {
+            Ok(()) => "the sender closed the connection".to_string(),
+            Err(err) => err.to_string(),
+        };
+        if problem != last_problem {
+            if monitor.live {
+                print!("\r{:width$}\r", "", width = STATUS_WIDTH);
+            }
+            println!("{url}: {problem}; trying again every {} s", RECONNECT_EVERY.as_secs());
+            last_problem = problem;
+        }
+        monitor.forget_sender();
+        let retry = Instant::now() + RECONNECT_EVERY;
+        while Instant::now() < retry {
+            std::thread::sleep(STATUS_EVERY);
+            monitor.tick(jitter, peak);
+        }
+    }
+}
+
+/// One connection to the sender's stream, until it ends.
+fn websocket_session(target: &WsTarget, options: &Options, jitter: &Mutex<Jitter>, peak: &AtomicU32, monitor: &mut Monitor, sequence: &mut u16) -> Result<(), Box<dyn Error>> {
+    let stream = TcpStream::connect((target.host.as_str(), target.port))?;
+    // Frames are small and every 20 ms: send them at once rather than gathering them.
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let peer = stream.peer_addr()?.to_string();
+    let (mut socket, _) = tungstenite::client(target.request.as_str(), stream)
+        .map_err(|err| format!("no rtp-audio stream there ({err})"))?;
+
+    // First a text message saying what follows: {"codec":"opus","sampleRate":48000,"channels":2,…}.
+    let header = loop {
+        match socket.read()? {
+            Message::Text(text) => break text.to_string(),
+            Message::Close(_) => return Ok(()),
+            _ => {}
+        }
+    };
+    if !header.contains(r#""codec":"opus""#) {
+        return Err(format!("unexpected stream from the sender: {header}").into());
+    }
+    let channels = header
+        .split(r#""channels":"#)
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(2);
+    if channels != options.channels {
+        return Err(format!("the sender sends {channels} channel(s); start the receiver with --channels {channels}").into());
+    }
+    let mut decoder = opus::Decoder::new(48_000, if channels == 1 { opus::Channels::Mono } else { opus::Channels::Stereo })?;
+    socket.get_mut().set_read_timeout(Some(STATUS_EVERY))?;
+
+    let mut pcm = vec![0i16; 5760 * channels];
+    loop {
+        match socket.read() {
+            Ok(Message::Binary(data)) => {
+                let samples = decoder.decode(&data, &mut pcm, false)?;
+                let frame: Vec<u8> = pcm[..samples * channels].iter().flat_map(|s| s.to_be_bytes()).collect();
+                jitter.lock().unwrap().push(*sequence, &frame, channels);
+                *sequence = sequence.wrapping_add(1);
+                monitor.arrived(&peer, || "Opus over TCP".to_string());
+            }
+            // A sender stopped with Ctrl+C just drops the connection: that's an ordinary end too.
+            Ok(Message::Close(_))
+            | Err(tungstenite::Error::ConnectionClosed
+            | tungstenite::Error::AlreadyClosed
+            | tungstenite::Error::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)) => return Ok(()),
+            Err(tungstenite::Error::Io(err)) if err.kind() == ErrorKind::ConnectionReset => return Ok(()),
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(err)) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(err) => return Err(err.into()),
+        }
+        monitor.tick(jitter, peak);
+    }
+}
+
+/// Where a `ws://HOST[:PORT][/PATH]` URL points. The sender serves its stream at /ws; a URL that
+/// ends in / (e.g. behind a proxy at /audio/) gets ws added.
+struct WsTarget {
+    host: String,
+    port: u16,
+    request: String,
+}
+
+impl WsTarget {
+    fn parse(url: &str) -> Result<Self, String> {
+        if url.starts_with("wss://") {
+            return Err("wss:// isn't supported yet: use ws:// through an SSH tunnel (ssh -L 46080:localhost:46080 SERVER)".into());
+        }
+        let rest = url.strip_prefix("ws://").ok_or_else(|| format!("'{url}' is not a ws:// URL"))?;
+        let (authority, path) = rest.find('/').map_or((rest, "/"), |i| (&rest[..i], &rest[i..]));
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => (host, port.parse::<u16>().map_err(|_| format!("bad port in '{url}'"))?),
+            None => (authority, 80),
+        };
+        if host.is_empty() {
+            return Err(format!("no host in '{url}'"));
+        }
+        let path = if path.ends_with('/') { format!("{path}ws") } else { path.to_string() };
+        Ok(WsTarget { host: host.to_string(), port, request: format!("ws://{authority}{path}") })
+    }
+}
+
+/// The live status line at a terminal, or occasional reports in a log, for either source.
+struct Monitor {
+    live: bool,
+    rate: u32,
+    sender: Option<String>,
+    packets: u32,
+    last_status: Instant,
+    shown: Stats,
+    last_report: Instant,
+    reported: Stats,
+    last_packet: Instant,
+    silent_reported: bool,
+}
+
+impl Monitor {
+    fn new(rate: u32) -> Self {
+        let now = Instant::now();
+        Monitor {
+            // At a terminal, one status line updates in place; in a log, only events and problems.
+            live: std::io::stdout().is_terminal(),
+            rate,
+            sender: None,
+            packets: 0,
+            last_status: now,
+            shown: Stats::default(),
+            last_report: now,
+            reported: Stats::default(),
+            last_packet: now,
+            silent_reported: true,
+        }
+    }
+
+    /// Sound arrived from `from`; when that's a new sender, says so with `describe()`.
+    fn arrived(&mut self, from: &str, describe: impl FnOnce() -> String) {
+        self.packets += 1;
+        self.last_packet = Instant::now();
+        self.silent_reported = false;
+        if self.sender.as_deref() != Some(from) {
+            if self.live {
+                print!("\r{:width$}\r", "", width = STATUS_WIDTH);
+            }
+            println!("Receiving from {from} ({})", describe());
+            self.sender = Some(from.to_string());
+        }
+    }
+
+    /// The connection ended: the next sound announces its sender again.
+    fn forget_sender(&mut self) {
+        self.sender = None;
+    }
+
+    fn tick(&mut self, jitter: &Mutex<Jitter>, peak: &AtomicU32) {
         let (stats, buffered) = {
             let jitter = jitter.lock().unwrap();
             (jitter.stats, jitter.buffered())
         };
-        if live && last_status.elapsed() >= STATUS_EVERY {
-            let seconds = last_status.elapsed().as_secs_f32();
+        if self.live && self.last_status.elapsed() >= STATUS_EVERY {
+            let seconds = self.last_status.elapsed().as_secs_f32();
             let level = f32::from_bits(peak.swap(0, Ordering::Relaxed));
-            let waiting = last_packet.elapsed() > Duration::from_secs(1);
-            print!("\r{}", status_line(sender, waiting, packets as f32 / seconds, buffered * 1000 / options.rate as usize, &stats, &shown, level));
+            let waiting = self.last_packet.elapsed() > Duration::from_secs(1);
+            let line = status_line(self.sender.as_deref(), waiting, self.packets as f32 / seconds, buffered * 1000 / self.rate as usize, &stats, &self.shown, level);
+            print!("\r{line}");
             let _ = std::io::stdout().flush();
-            (last_status, packets) = (Instant::now(), 0);
-            if stats != shown && last_report.elapsed() >= REPORT_EVERY {
-                (shown, last_report) = (stats, Instant::now());
+            (self.last_status, self.packets) = (Instant::now(), 0);
+            if stats != self.shown && self.last_report.elapsed() >= REPORT_EVERY {
+                (self.shown, self.last_report) = (stats, Instant::now());
             }
-        } else if !live {
-            if last_report.elapsed() >= REPORT_EVERY && stats != reported {
-                report(&reported, &stats);
-                reported = stats;
-                last_report = Instant::now();
+        } else if !self.live {
+            if self.last_report.elapsed() >= REPORT_EVERY && stats != self.reported {
+                report(&self.reported, &stats);
+                self.reported = stats;
+                self.last_report = Instant::now();
             }
-            if !silent_reported && last_packet.elapsed() > Duration::from_secs(5) {
+            if !self.silent_reported && self.last_packet.elapsed() > Duration::from_secs(5) {
                 println!("No sound arriving (sender stopped or paused)");
-                silent_reported = true;
+                self.silent_reported = true;
             }
         }
     }
@@ -294,7 +472,7 @@ const STATUS_EVERY: Duration = Duration::from_millis(250);
 const STATUS_WIDTH: usize = 100;
 
 /// The live status line: who, how much, how full the buffer is, problems, and a level meter.
-fn status_line(sender: Option<SocketAddr>, waiting: bool, rate: f32, buffer_ms: usize, now: &Stats, since: &Stats, level: f32) -> String {
+fn status_line(sender: Option<&str>, waiting: bool, rate: f32, buffer_ms: usize, now: &Stats, since: &Stats, level: f32) -> String {
     let line = match sender {
         None => "Waiting for sound…".to_string(),
         Some(_) if waiting => format!("Waiting for sound… (problems so far: {} lost, {} dropouts)", now.lost, now.underruns),
@@ -437,5 +615,17 @@ mod tests {
         assert_eq!(frames(&mut unpacker, &first), [(0, 3840)]);
         // Packet 1 never arrives: it's concealed (same length) right before packet 2.
         assert_eq!(frames(&mut unpacker, &third), [(1, 3840), (2, 3840)]);
+    }
+
+    #[test]
+    fn websocket_urls() {
+        let t = super::WsTarget::parse("ws://localhost:46080").unwrap();
+        assert_eq!((t.host.as_str(), t.port, t.request.as_str()), ("localhost", 46080, "ws://localhost:46080/ws"));
+        let t = super::WsTarget::parse("ws://10.0.0.2/audio/").unwrap();
+        assert_eq!((t.port, t.request.as_str()), (80, "ws://10.0.0.2/audio/ws"));
+        assert_eq!(super::WsTarget::parse("ws://h:1/custom").unwrap().request, "ws://h:1/custom");
+        assert!(super::WsTarget::parse("wss://h/").is_err());
+        assert!(super::WsTarget::parse("ws://:5").is_err());
+        assert!(super::WsTarget::parse("http://h").is_err());
     }
 }

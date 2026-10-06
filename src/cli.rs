@@ -13,6 +13,9 @@ usage:
       play RTP audio (16-bit PCM) arriving on a UDP port; --latency is the buffer in ms,
       --device an output from `rtp-audio devices`, --volume in percent, --group also
       listens to a multicast group
+  rtp-audio [receive] ws://HOST:PORT [--latency 60] [--device NAME] [--volume 100]
+      play the stream of `rtp-audio send --web` over TCP instead: nothing is lost, and it goes
+      through an SSH tunnel (ssh -L 46080:localhost:46080 SERVER, then ws://localhost:46080)
   rtp-audio devices
       list the sound outputs the receiver can play on
   rtp-audio find [--port 46000]
@@ -223,6 +226,18 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
         }
         _ => {
             only(&["--port", "--latency", "--rate", "--channels", "--device", "--volume", "--key", "--key-file", "--group", "--no-discovery"])?;
+            let mut url = None;
+            for arg in &positional {
+                if url.is_none() && (arg.starts_with("ws://") || arg.starts_with("wss://")) {
+                    url = Some(arg.clone());
+                } else {
+                    return Err(extra(arg));
+                }
+            }
+            if url.is_some() {
+                // The stream is Opus at 48 kHz, protected by the tunnel (or proxy) it goes through.
+                only(&["--latency", "--channels", "--device", "--volume"])?;
+            }
             let group = match group {
                 None => None,
                 Some(text) => match text.parse::<std::net::Ipv4Addr>() {
@@ -234,9 +249,6 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             if !(0.0..=400.0).contains(&volume) {
                 return Err("--volume must be between 0 and 400 (percent)".into());
             }
-            if let Some(arg) = positional.first() {
-                return Err(extra(arg));
-            }
             Ok(Command::Receive(receive::Options {
                 port: nonzero("--port", port.unwrap_or(46000))?,
                 latency_ms: nonzero("--latency", latency_ms.unwrap_or(60))?,
@@ -247,6 +259,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 key: read_key(key, key_file)?,
                 group,
                 discovery,
+                url,
             }))
         }
     }
@@ -376,6 +389,11 @@ mod tests {
         assert!(send.encoding.opus && send.encoding.key.is_some());
         assert!(matches!(parse(args(&format!("--key {key}"))), Ok(Command::Receive(o)) if o.key.is_some()));
         assert!(matches!(parse(args("--device Speakers --volume 50")), Ok(Command::Receive(o)) if o.volume == 0.5 && o.device.as_deref() == Some("Speakers")));
+        assert!(matches!(parse(args("ws://localhost:46080")), Ok(Command::Receive(o)) if o.url.as_deref() == Some("ws://localhost:46080")));
+        assert!(matches!(parse(args("receive ws://10.0.0.2:46080 --latency 150")), Ok(Command::Receive(o)) if o.latency_ms == 150 && o.url.is_some()));
+        assert!(parse(args("ws://localhost:46080 --port 5000")).is_err());
+        assert!(parse(args("ws://localhost:46080 --group 239.255.46.1")).is_err());
+        assert!(parse(args("ws://a ws://b")).is_err());
         assert!(matches!(parse(args("send 10.0.0.2:46000 --stdin --rate 44100")), Ok(Command::Send(s)) if s.rate == 44100));
     }
 

@@ -9,6 +9,9 @@ Hear a remote Linux desktop's sound on your own computer, over the network. One 
 - Or **in the browser**: `rtp-audio send --web 46080` serves the sound as Opus behind NGINX, with a
   🔊 button on the noVNC page. Nothing to install where you listen, and it travels inside HTTPS
   and behind the login. See [sound in the browser](docs/web.md).
+- Or **over TCP**: `rtp-audio ws://localhost:46080` plays that same web stream through an SSH
+  tunnel. Nothing lost, no open ports, and it copes with a busy link (e.g. next to RDP). See
+  [over TCP](docs/setup.md#over-tcp-through-an-ssh-tunnel-or-when-udp-struggles).
 
 > The UDP stream is **unencrypted by default**: noVNC and NGINX's HTTPS don't cover it. Use it on
 > a LAN or through a private VPN, encrypt it with `--key-file` (see [setup](docs/setup.md#smaller-and-encrypted)),
