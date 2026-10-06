@@ -21,8 +21,9 @@ pub struct Options {
     pub latency_ms: u32,
     pub rate: u32,
     pub channels: usize,
-    /// Output device name, or part of it; the default output if None.
-    pub device: Option<String>,
+    /// The --device value: an output (name, part of a name, or ID), or several separated by
+    /// commas, which play the same sound at once; the default output if empty.
+    pub devices: Vec<String>,
     /// 1.0 is unchanged.
     pub volume: f32,
     /// Only accept packets encrypted with this key.
@@ -184,30 +185,102 @@ fn pick_device(wanted: Option<&str>) -> Result<cpal::Device, Box<dyn Error>> {
     }
 }
 
+/// The outputs to play on: the default one, or each in the --device list. Device names and IDs
+/// can contain commas themselves ("HD-Audio Generic, ALC897 Analog", alsa:hw:CARD=Generic,DEV=0),
+/// so the list is read left to right, taking each time the longest run of comma-separated parts
+/// that is exactly an output's name or ID, else one part as (part of) a name.
+fn pick_devices(wanted: &[String]) -> Result<Vec<cpal::Device>, Box<dyn Error>> {
+    if wanted.is_empty() {
+        return Ok(vec![pick_device(None)?]);
+    }
+    let outputs = outputs()?;
+    let exact = |text: &str| outputs.iter().position(|o| o.id == text || o.name.eq_ignore_ascii_case(text));
+    let mut devices = Vec::new();
+    for value in wanted {
+        let parts: Vec<&str> = value.split(',').collect();
+        let mut i = 0;
+        while i < parts.len() {
+            let longest = (i + 1..=parts.len()).rev().find_map(|j| exact(parts[i..j].join(",").trim()).map(|k| (j, k)));
+            match longest {
+                Some((j, k)) => {
+                    devices.push(outputs[k].device.clone());
+                    i = j;
+                }
+                None => {
+                    let part = parts[i].trim();
+                    if !part.is_empty() {
+                        devices.push(pick_device(Some(part))?);
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    // The same output named twice would play the sound twice, slightly apart.
+    let mut seen = std::collections::HashSet::new();
+    devices.retain(|device| seen.insert(device_id(device)));
+    if devices.is_empty() {
+        return Err("--device names no output; see `rtp-audio devices`".into());
+    }
+    Ok(devices)
+}
+
+/// The jitter buffers of all the outputs: every frame goes into each.
+struct Buffers(Vec<Arc<Mutex<Jitter>>>);
+
+impl Buffers {
+    fn push(&self, sequence: u16, pcm: &[u8], channels: usize) {
+        for jitter in &self.0 {
+            jitter.lock().unwrap().push(sequence, pcm, channels);
+        }
+    }
+
+    /// For the status line: the worst of each problem across the outputs, and the emptiest buffer.
+    fn state(&self) -> (Stats, usize) {
+        let mut stats = Stats::default();
+        let mut buffered = usize::MAX;
+        for jitter in &self.0 {
+            let jitter = jitter.lock().unwrap();
+            let s = jitter.stats;
+            stats.lost = stats.lost.max(s.lost);
+            stats.late = stats.late.max(s.late);
+            stats.underruns = stats.underruns.max(s.underruns);
+            stats.trimmed = stats.trimmed.max(s.trimmed);
+            buffered = buffered.min(jitter.buffered());
+        }
+        (stats, if buffered == usize::MAX { 0 } else { buffered })
+    }
+}
+
 /// Receive RTP audio on a UDP port, or the sender's WebSocket stream, and play it on a sound
 /// card until killed.
 pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
-    let device = pick_device(options.device.as_deref())?;
-    let supported = device.default_output_config()?;
-    let format = supported.sample_format();
-    let config: StreamConfig = supported.into();
     let target = (options.rate * options.latency_ms / 1000).max(1) as usize;
-    let jitter = Arc::new(Mutex::new(Jitter::new(target)));
     // Loudest sample played since the status line last looked, as f32 bits.
     let peak = Arc::new(AtomicU32::new(0));
-    let out = Output { jitter: Arc::clone(&jitter), peak: Arc::clone(&peak), volume: options.volume, input_rate: options.rate };
-
-    let stream = match format {
-        SampleFormat::F32 => play::<f32>(&device, &config, out),
-        SampleFormat::I16 => play::<i16>(&device, &config, out),
-        SampleFormat::U16 => play::<u16>(&device, &config, out),
-        SampleFormat::I32 => play::<i32>(&device, &config, out),
-        SampleFormat::F64 => play::<f64>(&device, &config, out),
-        other => return Err(format!("sound card sample format {other} is not supported").into()),
-    }?;
-    stream.play()?;
-
-    let card = format!("sound card: {} ({} Hz, {} ch, {format})", device_name(&device), config.sample_rate, config.channels);
+    // One buffer per output: each sound card runs on its own clock, so each keeps its own level.
+    let (mut buffers, mut streams, mut cards) = (Vec::new(), Vec::new(), Vec::new());
+    for device in pick_devices(&options.devices)? {
+        let supported = device.default_output_config()?;
+        let format = supported.sample_format();
+        let config: StreamConfig = supported.into();
+        let jitter = Arc::new(Mutex::new(Jitter::new(target)));
+        let out = Output { jitter: Arc::clone(&jitter), peak: Arc::clone(&peak), volume: options.volume, input_rate: options.rate };
+        let stream = match format {
+            SampleFormat::F32 => play::<f32>(&device, &config, out),
+            SampleFormat::I16 => play::<i16>(&device, &config, out),
+            SampleFormat::U16 => play::<u16>(&device, &config, out),
+            SampleFormat::I32 => play::<i32>(&device, &config, out),
+            SampleFormat::F64 => play::<f64>(&device, &config, out),
+            other => return Err(format!("{}: sample format {other} is not supported", device_name(&device)).into()),
+        }?;
+        stream.play()?;
+        cards.push(format!("{} ({} Hz, {} ch, {format})", device_name(&device), config.sample_rate, config.channels));
+        buffers.push(jitter);
+        streams.push(stream);
+    }
+    let card = if cards.len() == 1 { format!("sound card: {}", cards[0]) } else { format!("{} sound cards: {}", cards.len(), cards.join("; ")) };
+    let jitter = Buffers(buffers);
     let mut monitor = Monitor::new(options.rate);
     match &options.url {
         Some(url) => receive_websocket(url, &options, &card, &jitter, &peak, &mut monitor),
@@ -223,7 +296,7 @@ fn print_volume_and_quit(options: &Options) {
 }
 
 /// RTP packets on a UDP port: plain, Opus or encrypted, from one sender or a multicast group.
-fn receive_udp(options: &Options, card: &str, jitter: &Mutex<Jitter>, peak: &AtomicU32, monitor: &mut Monitor) -> Result<(), Box<dyn Error>> {
+fn receive_udp(options: &Options, card: &str, jitter: &Buffers, peak: &AtomicU32, monitor: &mut Monitor) -> Result<(), Box<dyn Error>> {
     let socket = bind(options.port, options.group)?;
     println!(
         "Listening on UDP port {} ({} Hz, {} ch, {} ms buffer); {card}",
@@ -257,7 +330,6 @@ fn receive_udp(options: &Options, card: &str, jitter: &Mutex<Jitter>, peak: &Ato
                     let codec = if unpacker.last_opus.is_some_and(|(ssrc, _)| ssrc == packet.ssrc) { "Opus" } else { "L16" };
                     format!("{codec}, {}", if encrypted { "encrypted" } else { "not encrypted" })
                 });
-                let mut jitter = jitter.lock().unwrap();
                 for (sequence, pcm) in &frames {
                     jitter.push(*sequence, pcm, options.channels);
                 }
@@ -274,7 +346,7 @@ const RECONNECT_EVERY: Duration = Duration::from_secs(2);
 
 /// The sender's WebSocket stream (`rtp-audio send --web`): Opus over TCP, so nothing is lost
 /// and it goes through an SSH tunnel or a proxy; it reconnects by itself when the sender restarts.
-fn receive_websocket(url: &str, options: &Options, card: &str, jitter: &Mutex<Jitter>, peak: &AtomicU32, monitor: &mut Monitor) -> Result<(), Box<dyn Error>> {
+fn receive_websocket(url: &str, options: &Options, card: &str, jitter: &Buffers, peak: &AtomicU32, monitor: &mut Monitor) -> Result<(), Box<dyn Error>> {
     let target = WsTarget::parse(url)?;
     println!("Receiving from {url} over TCP ({} ms buffer); {card}", options.latency_ms);
     print_volume_and_quit(options);
@@ -304,7 +376,7 @@ fn receive_websocket(url: &str, options: &Options, card: &str, jitter: &Mutex<Ji
 }
 
 /// One connection to the sender's stream, until it ends.
-fn websocket_session(target: &WsTarget, options: &Options, jitter: &Mutex<Jitter>, peak: &AtomicU32, monitor: &mut Monitor, sequence: &mut u16) -> Result<(), Box<dyn Error>> {
+fn websocket_session(target: &WsTarget, options: &Options, jitter: &Buffers, peak: &AtomicU32, monitor: &mut Monitor, sequence: &mut u16) -> Result<(), Box<dyn Error>> {
     let stream = TcpStream::connect((target.host.as_str(), target.port))?;
     // Frames are small and every 20 ms: send them at once rather than gathering them.
     stream.set_nodelay(true)?;
@@ -342,7 +414,7 @@ fn websocket_session(target: &WsTarget, options: &Options, jitter: &Mutex<Jitter
             Ok(Message::Binary(data)) => {
                 let samples = decoder.decode(&data, &mut pcm, false)?;
                 let frame: Vec<u8> = pcm[..samples * channels].iter().flat_map(|s| s.to_be_bytes()).collect();
-                jitter.lock().unwrap().push(*sequence, &frame, channels);
+                jitter.push(*sequence, &frame, channels);
                 *sequence = sequence.wrapping_add(1);
                 monitor.arrived(&peer, || "Opus over TCP".to_string());
             }
@@ -438,11 +510,8 @@ impl Monitor {
         self.sender = None;
     }
 
-    fn tick(&mut self, jitter: &Mutex<Jitter>, peak: &AtomicU32) {
-        let (stats, buffered) = {
-            let jitter = jitter.lock().unwrap();
-            (jitter.stats, jitter.buffered())
-        };
+    fn tick(&mut self, jitter: &Buffers, peak: &AtomicU32) {
+        let (stats, buffered) = jitter.state();
         if self.live && self.last_status.elapsed() >= STATUS_EVERY {
             let seconds = self.last_status.elapsed().as_secs_f32();
             let level = f32::from_bits(peak.swap(0, Ordering::Relaxed));

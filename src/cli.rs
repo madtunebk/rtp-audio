@@ -8,12 +8,13 @@ use crate::transport::Encoding;
 
 pub const USAGE: &str = "\
 usage:
-  rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME] [--volume 100]
+  rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME[,NAME…]] [--volume 100]
                      [--group 239.255.46.1] [--no-discovery]
       play RTP audio (16-bit PCM) arriving on a UDP port; --latency is the buffer in ms,
-      --device an output from `rtp-audio devices`, --volume in percent, --group also
+      --device an output from `rtp-audio devices` (several, separated by commas, play the same
+      sound at once: --device 'HDMI, Headphones'), --volume in percent, --group also
       listens to a multicast group
-  rtp-audio [receive] ws://HOST:PORT [--latency 60] [--device NAME] [--volume 100]
+  rtp-audio [receive] ws://HOST:PORT [--latency 60] [--device NAME[,NAME…]] [--volume 100]
       play the stream of `rtp-audio send --web` over TCP instead: nothing is lost, and it goes
       through an SSH tunnel (ssh -L 46080:localhost:46080 SERVER, then ws://localhost:46080)
   rtp-audio devices
@@ -90,7 +91,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
     let mut positional = Vec::new();
     let (mut port, mut latency_ms, mut rate, mut channels) = (None, None, None, None);
     let (mut source, mut stdin, mut web) = (None, false, None);
-    let (mut device, mut volume) = (None, None);
+    let (mut devices, mut volume): (Vec<String>, _) = (Vec::new(), None);
     let (mut opus, mut key, mut key_file, mut mic) = (false, None, None, false);
     let (mut group, mut discovery) = (None, true);
     let mut args = args.into_iter();
@@ -106,7 +107,11 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             "-s" | "--source" => source = Some(value()?),
             "--stdin" => stdin = true,
             "--web" => web = Some(value()?),
-            "--device" => device = Some(value()?),
+            // Several outputs: one --device with a comma-separated list.
+            "--device" if !devices.is_empty() => {
+                return Err("--device is given once: list several outputs separated by commas, e.g. --device \"HDMI, Headphones\"".into())
+            }
+            "--device" => devices.push(value()?),
             "--opus" => opus = true,
             "--mic" => mic = true,
             "--group" => group = Some(value()?),
@@ -131,7 +136,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             ("--source", source.is_some()),
             ("--stdin", stdin),
             ("--web", web.is_some()),
-            ("--device", device.is_some()),
+            ("--device", !devices.is_empty()),
             ("--volume", volume.is_some()),
             ("--opus", opus),
             ("--key", key.is_some()),
@@ -254,7 +259,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 latency_ms: nonzero("--latency", latency_ms.unwrap_or(60))?,
                 rate: nonzero("--rate", rate.unwrap_or(48_000))?,
                 channels: channels.unwrap_or(2),
-                device,
+                devices,
                 volume: volume / 100.0,
                 key: read_key(key, key_file)?,
                 group,
@@ -388,7 +393,8 @@ mod tests {
         let Ok(Command::Send(send)) = parse(args(&format!("send 10.0.0.2:46000 --opus --key {key}"))) else { panic!() };
         assert!(send.encoding.opus && send.encoding.key.is_some());
         assert!(matches!(parse(args(&format!("--key {key}"))), Ok(Command::Receive(o)) if o.key.is_some()));
-        assert!(matches!(parse(args("--device Speakers --volume 50")), Ok(Command::Receive(o)) if o.volume == 0.5 && o.device.as_deref() == Some("Speakers")));
+        assert!(matches!(parse(args("--device Speakers --volume 50")), Ok(Command::Receive(o)) if o.volume == 0.5 && o.devices == ["Speakers"]));
+        assert!(parse(args("--device HDMI --device Headphones")).is_err());
         assert!(matches!(parse(args("ws://localhost:46080")), Ok(Command::Receive(o)) if o.url.as_deref() == Some("ws://localhost:46080")));
         assert!(matches!(parse(args("receive ws://10.0.0.2:46080 --latency 150")), Ok(Command::Receive(o)) if o.latency_ms == 150 && o.url.is_some()));
         assert!(parse(args("ws://localhost:46080 --port 5000")).is_err());
