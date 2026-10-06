@@ -44,7 +44,12 @@ struct Unpacker {
     replay: ReplayWindow,
     decoder: Option<opus::Decoder>,
     channels: usize,
+    /// The rate the sound is played at (`--rate`): Opus is decoded straight to it.
+    rate: u32,
     last_opus: Option<(u32, u16)>,
+    /// Opus packets lost on the way and concealed in the last call to `frames`: the jitter buffer
+    /// sees no gap for them, so the receiver counts them as lost itself.
+    pub concealed: u16,
     /// Samples per channel in the last Opus packet: concealment fills exactly that much.
     opus_frame: usize,
     warned: Option<String>,
@@ -61,15 +66,16 @@ fn is_l16(payload_type: u8) -> bool {
 }
 
 impl Unpacker {
-    fn new(key: Option<Key>, channels: usize) -> Self {
-        Unpacker { key, replay: ReplayWindow::default(), decoder: None, channels, last_opus: None, opus_frame: 960, warned: None }
+    fn new(key: Option<Key>, channels: usize, rate: u32) -> Self {
+        let opus_frame = rate as usize / 50;
+        Unpacker { key, replay: ReplayWindow::default(), decoder: None, channels, rate, last_opus: None, concealed: 0, opus_frame, warned: None }
     }
 
     /// A new sender is being played: forget the decoder state of the last one.
     fn restart(&mut self) {
         self.decoder = None;
         self.last_opus = None;
-        self.opus_frame = 960;
+        self.opus_frame = self.rate as usize / 50;
     }
 
     /// The packet's real payload type and payload if it's for us: decrypted and not replayed
@@ -116,6 +122,7 @@ impl Unpacker {
     /// it is concealed rather than left silent; an Opus packet older than the last one decoded,
     /// or the same again, is dropped before it reaches the decoder (it would upset its state).
     fn frames(&mut self, ssrc: u32, sequence: u16, payload_type: u8, payload: Vec<u8>) -> Vec<(u16, Vec<u8>)> {
+        self.concealed = 0;
         if payload_type != rtp::OPUS {
             return vec![(sequence, payload)];
         }
@@ -131,9 +138,13 @@ impl Unpacker {
         };
 
         let channels = self.channels;
+        if ![8_000, 12_000, 16_000, 24_000, 48_000].contains(&self.rate) {
+            self.warn(&format!("Opus sound is arriving: it plays at --rate 8000, 12000, 16000, 24000 or 48000, not {}", self.rate));
+            return Vec::new();
+        }
         let decoder = match &mut self.decoder {
             Some(decoder) => decoder,
-            slot => match opus::Decoder::new(48_000, if channels == 1 { opus::Channels::Mono } else { opus::Channels::Stereo }) {
+            slot => match opus::Decoder::new(self.rate, if channels == 1 { opus::Channels::Mono } else { opus::Channels::Stereo }) {
                 Ok(decoder) => slot.insert(decoder),
                 Err(err) => {
                     eprintln!("cannot decode Opus: {err}");
@@ -163,6 +174,7 @@ impl Unpacker {
             for k in 1..=gap {
                 decode(decoder, last.wrapping_add(k), &[]);
             }
+            self.concealed = gap;
         }
         // Only a packet that decoded moves the reference on.
         if decode(decoder, sequence, &payload) {
@@ -289,6 +301,13 @@ impl Buffers {
         }
     }
 
+    /// Packets lost on the way that the jitter buffers saw no gap for (concealed by Opus).
+    fn count_lost(&self, packets: u16) {
+        for jitter in &self.0 {
+            jitter.lock().unwrap().stats.lost += u64::from(packets);
+        }
+    }
+
     /// A new sender: drop what's buffered from the last one.
     fn restart(&self) {
         for jitter in &self.0 {
@@ -316,7 +335,8 @@ impl Buffers {
 /// Receive RTP audio on a UDP port, or the sender's WebSocket stream, and play it on a sound
 /// card until killed.
 pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
-    let target = (options.rate * options.latency_ms / 1000).max(1) as usize;
+    // In 64 bits: the product of two accepted values can exceed 32.
+    let target = (u64::from(options.rate) * u64::from(options.latency_ms) / 1000).max(1) as usize;
     // Loudest sample played since the status line last looked, as f32 bits.
     let peak = Arc::new(AtomicU32::new(0));
     // One buffer per output: each sound card runs on its own clock, so each keeps its own level.
@@ -366,7 +386,7 @@ fn receive_udp(options: &Options, card: &str, jitter: &Buffers, peak: &AtomicU32
     print_volume_and_quit(options);
     socket.set_read_timeout(Some(STATUS_EVERY))?;
     let mut buf = [0u8; 65536];
-    let mut unpacker = Unpacker::new(options.key.clone(), options.channels);
+    let mut unpacker = Unpacker::new(options.key.clone(), options.channels, options.rate);
     // The sender being played (address and SSRC) and when it was last heard.
     let mut active: Option<(SocketAddr, u32, Instant)> = None;
     if options.key.is_some() {
@@ -404,6 +424,9 @@ fn receive_udp(options: &Options, card: &str, jitter: &Buffers, peak: &AtomicU32
                 }
                 active = Some((from, packet.ssrc, Instant::now()));
                 let frames = unpacker.frames(packet.ssrc, packet.sequence, payload_type, payload);
+                if unpacker.concealed > 0 {
+                    jitter.count_lost(unpacker.concealed);
+                }
                 if frames.is_empty() {
                     continue;
                 }
@@ -760,10 +783,23 @@ mod tests {
             [&rtp::header(sequence, 0, 9, rtp::OPUS)[..], &out[..len]].concat()
         };
         let (first, _lost, third) = (packet(0), packet(1), packet(2));
-        let mut unpacker = Unpacker::new(None, 2);
+        let mut unpacker = Unpacker::new(None, 2, 48_000);
         assert_eq!(frames(&mut unpacker, &first), [(0, 3840)]);
         // Packet 1 never arrives: it's concealed (same length) right before packet 2.
         assert_eq!(frames(&mut unpacker, &third), [(1, 3840), (2, 3840)]);
+        assert_eq!(unpacker.concealed, 1); // counted as lost by the receiver
+    }
+
+    #[test]
+    fn opus_decodes_at_the_playing_rate() {
+        let mut encoder = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio).unwrap();
+        let mut out = vec![0u8; 4000];
+        let len = encoder.encode(&vec![0i16; 960 * 2], &mut out).unwrap();
+        let packet = [&rtp::header(0, 0, 9, rtp::OPUS)[..], &out[..len]].concat();
+        // 20 ms at 16 kHz stereo: 320 frames of 4 bytes.
+        assert_eq!(frames(&mut Unpacker::new(None, 2, 16_000), &packet), [(0, 1280)]);
+        // A rate Opus can't decode to: nothing, with a warning.
+        assert!(frames(&mut Unpacker::new(None, 2, 44_100), &packet).is_empty());
     }
 
     fn frames(u: &mut Unpacker, data: &[u8]) -> Vec<(u16, usize)> {
@@ -782,7 +818,7 @@ mod tests {
             [&rtp::header(sequence, 0, 9, rtp::OPUS)[..], &out[..len]].concat()
         };
         let (p10, p11, p12, p13) = (packet(10), packet(11), packet(12), packet(13));
-        let mut unpacker = Unpacker::new(None, 2);
+        let mut unpacker = Unpacker::new(None, 2, 48_000);
         assert_eq!(frames(&mut unpacker, &p10), [(10, 3840)]);
         assert_eq!(frames(&mut unpacker, &p12), [(11, 3840), (12, 3840)]); // 11 concealed
         assert!(frames(&mut unpacker, &p11).is_empty()); // late: not decoded
@@ -792,7 +828,7 @@ mod tests {
 
     #[test]
     fn only_l16_and_opus_are_played() {
-        let mut unpacker = Unpacker::new(None, 2);
+        let mut unpacker = Unpacker::new(None, 2, 48_000);
         let with_type = |pt: u8, payload: &[u8]| [&rtp::header(1, 0, 9, pt)[..], payload].concat();
         assert_eq!(frames(&mut unpacker, &with_type(rtp::L16, &[0; 960])), [(1, 960)]);
         assert_eq!(frames(&mut unpacker, &with_type(10, &[0; 960])), [(1, 960)]); // static L16

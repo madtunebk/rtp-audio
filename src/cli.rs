@@ -225,7 +225,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 mic,
                 source,
                 stdin,
-                rate: nonzero("--rate", rate.unwrap_or(48_000))?,
+                rate: within("--rate", rate.unwrap_or(48_000), RATES, "Hz")?,
                 channels: channels.unwrap_or(2),
             }))
         }
@@ -256,8 +256,8 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }
             Ok(Command::Receive(receive::Options {
                 port: nonzero("--port", port.unwrap_or(46000))?,
-                latency_ms: nonzero("--latency", latency_ms.unwrap_or(60))?,
-                rate: nonzero("--rate", rate.unwrap_or(48_000))?,
+                latency_ms: within("--latency", latency_ms.unwrap_or(60), LATENCIES, "ms")?,
+                rate: within("--rate", rate.unwrap_or(48_000), RATES, "Hz")?,
                 channels: channels.unwrap_or(2),
                 devices,
                 volume: volume / 100.0,
@@ -294,6 +294,20 @@ fn number<T: std::str::FromStr>(option: &str, text: &str) -> Result<T, String> {
 
 fn nonzero<T: Default + PartialEq>(option: &str, value: T) -> Result<T, String> {
     if value == T::default() { Err(format!("{option} must be above 0")) } else { Ok(value) }
+}
+
+/// Sample rates sound cards and Opus use: a smaller or larger one is a typo, and would make
+/// empty or oversized packets.
+pub const RATES: std::ops::RangeInclusive<u32> = 8_000..=192_000;
+/// The receiver's buffer: at least one 20 ms Opus packet, at most two seconds.
+const LATENCIES: std::ops::RangeInclusive<u32> = 20..=2_000;
+
+fn within(option: &str, value: u32, range: std::ops::RangeInclusive<u32>, unit: &str) -> Result<u32, String> {
+    if range.contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{option} must be between {} and {} {unit}", range.start(), range.end()))
+    }
 }
 
 fn read_key(key: Option<String>, key_file: Option<String>) -> Result<Option<Key>, String> {
@@ -401,6 +415,13 @@ mod tests {
         assert!(parse(args("ws://localhost:46080 --group 239.255.46.1")).is_err());
         assert!(parse(args("ws://a ws://b")).is_err());
         assert!(matches!(parse(args("send 10.0.0.2:46000 --stdin --rate 44100")), Ok(Command::Send(s)) if s.rate == 44100));
+        // Rates and buffers outside what sound cards and packets allow are refused.
+        assert!(parse(args("send 10.0.0.2:46000 --stdin --rate 1")).is_err());
+        assert!(parse(args("send 10.0.0.2:46000 --stdin --rate 4000000000")).is_err());
+        assert!(parse(args("--rate 1")).is_err());
+        assert!(parse(args("--latency 1")).is_err());
+        assert!(parse(args("--latency 100000")).is_err());
+        assert!(matches!(parse(args("--latency 20 --rate 8000")), Ok(Command::Receive(o)) if o.latency_ms == 20 && o.rate == 8000));
     }
 
     #[test]

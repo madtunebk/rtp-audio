@@ -28,7 +28,12 @@ pub fn parse(data: &[u8]) -> Option<Packet<'_>> {
     }
     let mut end = data.len();
     if data[0] & 0x20 != 0 {
-        end = end.checked_sub(*data.last()? as usize)?;
+        // The last byte counts the padding, itself included: 0 is not a valid count.
+        let padding = *data.last()? as usize;
+        if padding == 0 {
+            return None;
+        }
+        end = end.checked_sub(padding)?;
     }
     let payload = data.get(start..end)?;
     Some(Packet {
@@ -77,5 +82,13 @@ mod tests {
     fn rejects_non_rtp() {
         assert!(parse(&[0; 4]).is_none());
         assert!(parse(&[0; 20]).is_none());
+    }
+
+    #[test]
+    fn rejects_a_padding_count_of_zero() {
+        let mut packet = header(1, 2, 3, super::L16).to_vec();
+        packet[0] |= 0x20;
+        packet.extend_from_slice(&[1, 2, 0]);
+        assert!(parse(&packet).is_none());
     }
 }

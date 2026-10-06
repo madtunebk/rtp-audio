@@ -39,8 +39,10 @@ pub struct RtpSender {
     ssrc: u32,
     sequence: u16,
     timestamp: u32,
+    /// How far the RTP timestamp moves per packet: samples at the rate sent, except for Opus,
+    /// whose RTP clock always runs at 48 kHz.
+    timestamp_step: u32,
     channels: usize,
-    frames_per_packet: u32,
     encoder: Option<opus::Encoder>,
     key: Option<Key>,
     counter: u64,
@@ -71,8 +73,12 @@ impl RtpSender {
         } else {
             None
         };
+        if !crate::cli::RATES.contains(&rate) {
+            return Err(format!("the rate must be between {} and {} Hz, not {rate}", crate::cli::RATES.start(), crate::cli::RATES.end()).into());
+        }
         let packet_ms = if encoder.is_some() { OPUS_PACKET_MS } else { PCM_PACKET_MS };
         let frames_per_packet = rate * packet_ms / 1000;
+        let timestamp_step = if encoder.is_some() { 48_000 * packet_ms / 1000 } else { frames_per_packet };
         // A random SSRC, and random starting sequence, timestamp and counter (RFC 3550 asks for the
         // first three). With a key, SSRC + counter is the nonce: random starts keep two sessions
         // using the same key (restarts, other computers) from ever reusing one.
@@ -88,8 +94,8 @@ impl RtpSender {
             ssrc,
             sequence,
             timestamp,
+            timestamp_step,
             channels,
-            frames_per_packet,
             encoder,
             key: encoding.key,
             counter,
@@ -138,7 +144,7 @@ impl RtpSender {
             _ => {}
         }
         self.sequence = self.sequence.wrapping_add(1);
-        self.timestamp = self.timestamp.wrapping_add(self.frames_per_packet);
+        self.timestamp = self.timestamp.wrapping_add(self.timestamp_step);
         Ok(())
     }
 
@@ -221,6 +227,28 @@ mod tests {
         }
         // Consecutive within the session, from a random start.
         assert_eq!(counters[1], counters[0] + 1);
+    }
+
+    #[test]
+    fn opus_timestamps_run_at_48_khz_whatever_the_rate() {
+        let receiver = receiver();
+        let encoding = Encoding { opus: true, key: None };
+        let mut sender = RtpSender::connect(receiver.local_addr().unwrap(), 8_000, 1, encoding).unwrap();
+        sender.push(&vec![0u8; 160 * 2 * 2]).unwrap(); // two 20 ms packets at 8 kHz mono
+        let mut buf = [0u8; 2048];
+        let mut stamps = Vec::new();
+        for _ in 0..2 {
+            receiver.recv(&mut buf).unwrap();
+            stamps.push(u32::from_be_bytes(buf[4..8].try_into().unwrap()));
+        }
+        assert_eq!(stamps[1].wrapping_sub(stamps[0]), 960);
+    }
+
+    #[test]
+    fn rates_outside_the_audio_range_are_refused() {
+        let to = receiver().local_addr().unwrap();
+        assert!(RtpSender::connect(to, 1, 2, Encoding::default()).is_err());
+        assert!(RtpSender::connect(to, 400_000, 2, Encoding::default()).is_err());
     }
 
     #[test]
