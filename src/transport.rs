@@ -4,6 +4,7 @@
 use std::error::Error;
 use std::io::{ErrorKind, Read};
 use std::net::{SocketAddr, UdpSocket};
+use std::time::{Duration, Instant};
 
 use crate::rtp;
 use crate::secure::Key;
@@ -119,6 +120,26 @@ impl RtpSender {
         Ok(())
     }
 
+    /// Send what's left at the end of the input: L16 as a shorter packet of whole frames, Opus
+    /// padded with silence to a full frame (it only takes fixed sizes).
+    pub fn finish(&mut self) -> std::io::Result<()> {
+        if self.encoder.is_some() {
+            if self.pending.is_empty() {
+                return Ok(());
+            }
+            self.pending.resize(self.packet_bytes, 0);
+        } else {
+            let whole = self.pending.len() / (self.channels * 2) * self.channels * 2;
+            self.pending.truncate(whole);
+            if self.pending.is_empty() {
+                return Ok(());
+            }
+        }
+        self.send_packet()?;
+        self.pending.clear();
+        Ok(())
+    }
+
     fn send_packet(&mut self) -> std::io::Result<()> {
         let (payload_type, payload): (u8, &[u8]) = match &mut self.encoder {
             None => (rtp::L16, &self.pending),
@@ -163,15 +184,34 @@ pub fn send_stdin(destination: SocketAddr, rate: u32, channels: usize, encoding:
     eprintln!("Sending {rate} Hz, {} from stdin to {destination}", sender.describe());
     let mut stdin = std::io::stdin().lock();
     let mut buf = [0u8; 4096];
+    // Paced to real time: a file (or anything faster than live) is sent as it would play, not
+    // all at once. Measured from the start, so waits never add up to a drift; live input, which
+    // arrives in time anyway, is never held back by more than the lead.
+    let started = Instant::now();
+    let bytes_per_second = f64::from(rate) * channels as f64 * 2.0;
+    let mut sent = 0u64;
     loop {
         match stdin.read(&mut buf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => sender.push(&buf[..n])?,
+            Ok(0) => {
+                sender.finish()?;
+                return Ok(());
+            }
+            Ok(n) => {
+                sender.push(&buf[..n])?;
+                sent += n as u64;
+                let due = Duration::from_secs_f64(sent as f64 / bytes_per_second);
+                if let Some(ahead) = due.checked_sub(started.elapsed() + STDIN_LEAD) {
+                    std::thread::sleep(ahead);
+                }
+            }
             Err(err) if err.kind() == ErrorKind::Interrupted => {}
             Err(err) => return Err(err.into()),
         }
     }
 }
+
+/// How far ahead of real time `--stdin` may send: enough for the receiver's buffer to fill.
+const STDIN_LEAD: Duration = Duration::from_millis(100);
 
 #[cfg(test)]
 mod tests {

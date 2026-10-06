@@ -397,10 +397,13 @@ fn receive_udp(options: &Options, card: &str, jitter: &Buffers, peak: &AtomicU32
     }
     loop {
         match socket.recv_from(&mut buf) {
-            Ok((len, from)) => {
+            Ok((len, reply_to)) => {
+                // On the dual-stack socket an IPv4 sender shows as ::ffff:a.b.c.d: show it as IPv4
+                // (but answer it at the address the socket knows).
+                let from = SocketAddr::new(reply_to.ip().to_canonical(), reply_to.port());
                 let Some(packet) = rtp::parse(&buf[..len]) else {
                     if options.discovery && discover::is_question(&buf[..len]) {
-                        let _ = socket.send_to(&discover::answer(options.port, options.key.is_some()), from);
+                        let _ = socket.send_to(&discover::answer(options.port, options.key.is_some()), reply_to);
                     }
                     continue;
                 };
@@ -554,9 +557,23 @@ impl WsTarget {
         }
         let rest = url.strip_prefix("ws://").ok_or_else(|| format!("'{url}' is not a ws:// URL"))?;
         let (authority, path) = rest.find('/').map_or((rest, "/"), |i| (&rest[..i], &rest[i..]));
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) => (host, port.parse::<u16>().map_err(|_| format!("bad port in '{url}'"))?),
-            None => (authority, 80),
+        // An IPv6 address comes in brackets ([::1]:46080), since it has colons of its own.
+        let (host, port) = if let Some(inside) = authority.strip_prefix('[') {
+            let (host, after) = inside.split_once(']').ok_or_else(|| format!("unclosed [ in '{url}'"))?;
+            let port = match after.strip_prefix(':') {
+                Some(port) => port.parse::<u16>().map_err(|_| format!("bad port in '{url}'"))?,
+                None if after.is_empty() => 80,
+                None => return Err(format!("bad address in '{url}'")),
+            };
+            (host, port)
+        } else {
+            match authority.split_once(':') {
+                Some((_, port)) if port.contains(':') => {
+                    return Err(format!("put an IPv6 address in brackets: ws://[{authority}]/ or ws://[ADDRESS]:PORT"));
+                }
+                Some((host, port)) => (host, port.parse::<u16>().map_err(|_| format!("bad port in '{url}'"))?),
+                None => (authority, 80),
+            }
         };
         if host.is_empty() {
             return Err(format!("no host in '{url}'"));
@@ -689,6 +706,13 @@ fn report(before: &Stats, now: &Stats) {
 /// A UDP socket with a big receive buffer: Windows' default is small enough that a short
 /// hiccup in this thread overflows it and loses packets.
 fn bind(port: u16, group: Option<Ipv4Addr>) -> std::io::Result<UdpSocket> {
+    // IPv6 and IPv4 on one socket, where the system allows it; a multicast group (IPv4) needs
+    // an IPv4 socket.
+    if group.is_none()
+        && let Ok(socket) = bind_dual_stack(port)
+    {
+        return Ok(socket);
+    }
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     if let Err(err) = socket.set_recv_buffer_size(1 << 20) {
         eprintln!("could not enlarge the receive buffer: {err}");
@@ -701,6 +725,17 @@ fn bind(port: u16, group: Option<Ipv4Addr>) -> std::io::Result<UdpSocket> {
     if let Some(group) = group {
         join_everywhere(&socket, group)?;
     }
+    Ok(socket.into())
+}
+
+/// A UDP socket taking both IPv6 and IPv4 (as IPv4-mapped addresses) on `port`.
+fn bind_dual_stack(port: u16) -> std::io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(false)?;
+    if let Err(err) = socket.set_recv_buffer_size(1 << 20) {
+        eprintln!("could not enlarge the receive buffer: {err}");
+    }
+    socket.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())?;
     Ok(socket.into())
 }
 
@@ -847,5 +882,10 @@ mod tests {
         assert!(super::WsTarget::parse("wss://h/").is_err());
         assert!(super::WsTarget::parse("ws://:5").is_err());
         assert!(super::WsTarget::parse("http://h").is_err());
+        let t = super::WsTarget::parse("ws://[::1]:46080").unwrap();
+        assert_eq!((t.host.as_str(), t.port, t.request.as_str()), ("::1", 46080, "ws://[::1]:46080/ws"));
+        assert_eq!(super::WsTarget::parse("ws://[fe80::1]/audio/").unwrap().port, 80);
+        assert!(super::WsTarget::parse("ws://::1:46080").is_err()); // needs brackets
+        assert!(super::WsTarget::parse("ws://[::1").is_err());
     }
 }

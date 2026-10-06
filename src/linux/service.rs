@@ -59,6 +59,21 @@ fn unit_file(exe: &str, send_args: &[String]) -> String {
     )
 }
 
+/// Write `text` to `path`, readable only by you from the first byte (it may hold a --key), and
+/// whole: written beside it, then renamed over it.
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let temporary = path.with_extension("service.tmp");
+    let _ = std::fs::remove_file(&temporary);
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    // create_new with 0o600 is still subject to the umask, which can only remove bits; make sure.
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&temporary, path)
+}
+
 /// Is this user's service manager running? Without it (logged in through `su`/`sudo -u`, or
 /// no login session), `systemctl --user` has nothing to talk to.
 fn check_user_manager() -> Result<(), Box<dyn Error>> {
@@ -81,11 +96,13 @@ fn install(send_args: &[String]) -> Result<(), Box<dyn Error>> {
     check_user_manager()?;
     let exe = std::env::current_exe()?;
     let exe = exe.to_str().ok_or("the path to rtp-audio is not valid UTF-8")?;
+    // A line break would end the ExecStart= line and start another setting.
+    if std::iter::once(exe).chain(send_args.iter().map(String::as_str)).any(|arg| arg.chars().any(char::is_control)) {
+        return Err("the options (and the path to rtp-audio) can't contain line breaks or other control characters".into());
+    }
     let path = unit_path()?;
     std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(&path, unit_file(exe, send_args)).map_err(|err| format!("cannot write {}: {err}", path.display()))?;
-    // It may hold a --key: readable only by you.
-    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    write_private(&path, &unit_file(exe, send_args)).map_err(|err| format!("cannot write {}: {err}", path.display()))?;
     eprintln!("Wrote {}", path.display());
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", UNIT])?;

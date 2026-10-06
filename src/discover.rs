@@ -71,8 +71,14 @@ pub fn find(port: u16, wait: Duration) -> std::io::Result<Vec<Found>> {
         match socket.recv_from(&mut buf) {
             Ok((len, from)) => {
                 let Some(receiver) = parse_answer(&buf[..len], from) else { continue };
-                // A receiver on this computer may answer twice: keep its network address.
-                match found.iter().position(|f| f.name == receiver.name && f.address.port() == receiver.address.port()) {
+                // Each address once. A receiver on this computer may also answer on localhost: keep
+                // its network address. Two computers with the same name (clones) stay two.
+                let same_here = |f: &Found| {
+                    f.name == receiver.name
+                        && f.address.port() == receiver.address.port()
+                        && (f.address.ip().is_loopback() || receiver.address.ip().is_loopback())
+                };
+                match found.iter().position(|f| f.address == receiver.address || same_here(f)) {
                     Some(i) if found[i].address.ip().is_loopback() => found[i] = receiver,
                     Some(_) => {}
                     None => found.push(receiver),

@@ -149,11 +149,17 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Standard or URL-safe base64, padding optional.
+/// Standard or URL-safe base64, padding optional but only where it belongs (at the end, making
+/// the length a multiple of 4); leftover bits must be zero, so each key has one spelling.
 fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let body = text.trim_end_matches('=');
+    let padding = text.len() - body.len();
+    if padding > 2 || (padding > 0 && !text.len().is_multiple_of(4)) || body.len() % 4 == 1 {
+        return None;
+    }
     let mut out = Vec::new();
     let (mut acc, mut bits) = (0u32, 0);
-    for c in text.bytes().filter(|&c| c != b'=') {
+    for c in body.bytes() {
         let value = match c {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,
@@ -168,6 +174,9 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
             bits -= 8;
             out.push((acc >> bits) as u8);
         }
+    }
+    if acc & ((1 << bits) - 1) != 0 {
+        return None;
     }
     Some(out)
 }
@@ -220,6 +229,21 @@ mod tests {
         assert!(window.accept(1, 200));
         assert!(!window.accept(1, 100)); // too old to tell
         assert!(window.accept(2, 5)); // another sender starts over
+    }
+
+    #[test]
+    fn keys_have_one_spelling() {
+        let key = generate().unwrap();
+        assert!(Key::parse(&key).is_ok());
+        assert!(Key::parse(key.trim_end_matches('=')).is_ok()); // padding is optional
+        assert!(Key::parse(&format!("={key}")).is_err()); // but only at the end
+        assert!(Key::parse(&format!("{key}==")).is_err()); // and only as much as needed
+        // The same bytes with a different last character (non-zero leftover bits).
+        let mut changed = key.trim_end_matches('=').to_string();
+        let last = changed.pop().unwrap();
+        let index = ALPHABET.iter().position(|&c| c as char == last).unwrap();
+        changed.push(ALPHABET[index ^ 1] as char);
+        assert!(Key::parse(&changed).is_err());
     }
 
     #[test]
