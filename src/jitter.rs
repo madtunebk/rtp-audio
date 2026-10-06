@@ -90,6 +90,12 @@ impl Jitter {
         }
     }
 
+    /// Start over for a new sender: drop the buffered sound and forget the sequence numbers.
+    pub fn restart(&mut self) {
+        self.reset();
+        self.next_sequence = None;
+    }
+
     fn reset(&mut self) {
         self.frames.clear();
         self.playing = false;

@@ -36,7 +36,9 @@ pub struct Options {
     pub url: Option<String>,
 }
 
-/// Turns arriving packets (L16, Opus, or encrypted) into big-endian PCM for the jitter buffer.
+/// Turns arriving packets (L16, Opus, or encrypted) into big-endian PCM for the jitter buffer,
+/// in two steps: `open` checks a packet is for us (decrypting it with a key), `frames` decodes it.
+/// In between, the caller decides whether its sender is the one being played.
 struct Unpacker {
     key: Option<Key>,
     replay: ReplayWindow,
@@ -45,38 +47,88 @@ struct Unpacker {
     last_opus: Option<(u32, u16)>,
     /// Samples per channel in the last Opus packet: concealment fills exactly that much.
     opus_frame: usize,
-    warned: Option<&'static str>,
+    warned: Option<String>,
 }
 
 /// At most this many lost Opus packets in a row are concealed; beyond, silence.
 const MAX_CONCEAL: u16 = 5;
 
+/// Payload types played as L16 (16-bit big-endian PCM): rtp-audio's own, the static L16 types
+/// (10 stereo, 11 mono), and the dynamic range other tools use for it (PulseAudio, PipeWire,
+/// ffmpeg). Other static types (PCMU, PCMA, …) are other codecs, not sound we can play as is.
+fn is_l16(payload_type: u8) -> bool {
+    matches!(payload_type, 10 | 11 | 96..=127) && payload_type != rtp::OPUS && payload_type != secure::PAYLOAD_TYPE
+}
+
 impl Unpacker {
-    /// The packet's sound as (sequence, big-endian PCM) frames, oldest first; empty if it's
-    /// not for us. A lost Opus packet just before it is concealed rather than left silent.
-    fn unpack(&mut self, data: &[u8], packet: &rtp::Packet) -> Vec<(u16, Vec<u8>)> {
+    fn new(key: Option<Key>, channels: usize) -> Self {
+        Unpacker { key, replay: ReplayWindow::default(), decoder: None, channels, last_opus: None, opus_frame: 960, warned: None }
+    }
+
+    /// A new sender is being played: forget the decoder state of the last one.
+    fn restart(&mut self) {
+        self.decoder = None;
+        self.last_opus = None;
+        self.opus_frame = 960;
+    }
+
+    /// The packet's real payload type and payload if it's for us: decrypted and not replayed
+    /// when there's a key, plain otherwise; None (with a warning, once) if not.
+    fn open(&mut self, data: &[u8], packet: &rtp::Packet) -> Option<(u8, Vec<u8>)> {
         let (payload_type, payload) = if packet.payload_type == secure::PAYLOAD_TYPE {
             let Some(key) = &self.key else {
                 self.warn("Encrypted sound is arriving: start the receiver with --key or --key-file");
-                return Vec::new();
+                return None;
             };
             match key.open(data) {
                 Some((counter, payload_type, payload)) if self.replay.accept(packet.ssrc, counter) => (payload_type, payload),
-                Some(_) => return Vec::new(),
+                Some(_) => return None,
                 None => {
                     self.warn("Ignoring packets that don't match the key (wrong key, or not from rtp-audio)");
-                    return Vec::new();
+                    return None;
                 }
             }
         } else if self.key.is_some() {
             self.warn("Ignoring unencrypted sound: this receiver only accepts sound encrypted with its key");
-            return Vec::new();
+            return None;
         } else {
             (packet.payload_type, packet.payload.to_vec())
         };
-        if payload_type != rtp::OPUS {
-            return vec![(packet.sequence, payload)];
+        if payload_type == rtp::OPUS {
+            return Some((payload_type, payload));
         }
+        if !is_l16(payload_type) {
+            self.warn(&format!("Ignoring RTP payload type {payload_type}: only L16 and Opus can be played"));
+            return None;
+        }
+        if payload.len() % (2 * self.channels) != 0 {
+            self.warn(&format!(
+                "Ignoring packets whose sound doesn't divide into {}-channel 16-bit frames (try --channels {})",
+                self.channels,
+                3 - self.channels
+            ));
+            return None;
+        }
+        Some((payload_type, payload))
+    }
+
+    /// Big-endian PCM frames for an opened packet, oldest first. A lost Opus packet just before
+    /// it is concealed rather than left silent; an Opus packet older than the last one decoded,
+    /// or the same again, is dropped before it reaches the decoder (it would upset its state).
+    fn frames(&mut self, ssrc: u32, sequence: u16, payload_type: u8, payload: Vec<u8>) -> Vec<(u16, Vec<u8>)> {
+        if payload_type != rtp::OPUS {
+            return vec![(sequence, payload)];
+        }
+        let gap = match self.last_opus {
+            Some((last_ssrc, last)) if last_ssrc == ssrc => {
+                let step = sequence.wrapping_sub(last);
+                if step == 0 || step >= 0x8000 {
+                    return Vec::new();
+                }
+                step - 1
+            }
+            _ => 0,
+        };
 
         let channels = self.channels;
         let decoder = match &mut self.decoder {
@@ -91,36 +143,38 @@ impl Unpacker {
         };
         let mut frames = Vec::new();
         let opus_frame = &mut self.opus_frame;
-        let mut decode = |decoder: &mut opus::Decoder, sequence: u16, data: &[u8]| {
+        let mut decode = |decoder: &mut opus::Decoder, sequence: u16, data: &[u8]| -> bool {
             // Without data (a lost packet), Opus conceals as much as the buffer holds.
             let samples = if data.is_empty() { *opus_frame } else { 5760 };
             let mut pcm = vec![0i16; samples * channels];
-            if let Ok(n) = decoder.decode(data, &mut pcm, false) {
-                if !data.is_empty() {
-                    *opus_frame = n;
+            match decoder.decode(data, &mut pcm, false) {
+                Ok(n) => {
+                    if !data.is_empty() {
+                        *opus_frame = n;
+                    }
+                    frames.push((sequence, pcm[..n * channels].iter().flat_map(|s| s.to_be_bytes()).collect()));
+                    true
                 }
-                frames.push((sequence, pcm[..n * channels].iter().flat_map(|s| s.to_be_bytes()).collect()));
+                Err(_) => false,
             }
         };
-        if let Some((ssrc, last)) = self.last_opus
-            && ssrc == packet.ssrc
-        {
-            let gap = packet.sequence.wrapping_sub(last).wrapping_sub(1);
-            if (1..=MAX_CONCEAL).contains(&gap) {
-                for k in 1..=gap {
-                    decode(decoder, last.wrapping_add(k), &[]);
-                }
+        if (1..=MAX_CONCEAL).contains(&gap) {
+            let last = sequence.wrapping_sub(gap + 1);
+            for k in 1..=gap {
+                decode(decoder, last.wrapping_add(k), &[]);
             }
         }
-        decode(decoder, packet.sequence, &payload);
-        self.last_opus = Some((packet.ssrc, packet.sequence));
+        // Only a packet that decoded moves the reference on.
+        if decode(decoder, sequence, &payload) {
+            self.last_opus = Some((ssrc, sequence));
+        }
         frames
     }
 
-    fn warn(&mut self, message: &'static str) {
-        if self.warned != Some(message) {
+    fn warn(&mut self, message: &str) {
+        if self.warned.as_deref() != Some(message) {
             println!("{message}");
-            self.warned = Some(message);
+            self.warned = Some(message.to_string());
         }
     }
 }
@@ -235,6 +289,13 @@ impl Buffers {
         }
     }
 
+    /// A new sender: drop what's buffered from the last one.
+    fn restart(&self) {
+        for jitter in &self.0 {
+            jitter.lock().unwrap().restart();
+        }
+    }
+
     /// For the status line: the worst of each problem across the outputs, and the emptiest buffer.
     fn state(&self) -> (Stats, usize) {
         let mut stats = Stats::default();
@@ -305,7 +366,9 @@ fn receive_udp(options: &Options, card: &str, jitter: &Buffers, peak: &AtomicU32
     print_volume_and_quit(options);
     socket.set_read_timeout(Some(STATUS_EVERY))?;
     let mut buf = [0u8; 65536];
-    let mut unpacker = Unpacker { key: options.key.clone(), replay: ReplayWindow::default(), decoder: None, channels: options.channels, last_opus: None, opus_frame: 960, warned: None };
+    let mut unpacker = Unpacker::new(options.key.clone(), options.channels);
+    // The sender being played (address and SSRC) and when it was last heard.
+    let mut active: Option<(SocketAddr, u32, Instant)> = None;
     if options.key.is_some() {
         println!("Only accepting sound encrypted with the key.");
     }
@@ -322,12 +385,30 @@ fn receive_udp(options: &Options, card: &str, jitter: &Buffers, peak: &AtomicU32
                     continue;
                 };
                 let encrypted = packet.payload_type == secure::PAYLOAD_TYPE;
-                let frames = unpacker.unpack(&buf[..len], &packet);
+                // With a key, only a packet that opens with it can change who's played.
+                let Some((payload_type, payload)) = unpacker.open(&buf[..len], &packet) else {
+                    continue;
+                };
+                // One sender at a time: another is taken over only after the one playing has been
+                // quiet for a moment, and then the buffer and the decoder start afresh.
+                match active {
+                    Some((addr, ssrc, heard)) if (addr, ssrc) != (from, packet.ssrc) => {
+                        if heard.elapsed() < SENDER_QUIET {
+                            unpacker.warn(&format!("Ignoring sound from {from}: already playing {addr}"));
+                            continue;
+                        }
+                        jitter.restart();
+                        unpacker.restart();
+                    }
+                    _ => {}
+                }
+                active = Some((from, packet.ssrc, Instant::now()));
+                let frames = unpacker.frames(packet.ssrc, packet.sequence, payload_type, payload);
                 if frames.is_empty() {
                     continue;
                 }
                 monitor.arrived(&from.to_string(), || {
-                    let codec = if unpacker.last_opus.is_some_and(|(ssrc, _)| ssrc == packet.ssrc) { "Opus" } else { "L16" };
+                    let codec = if payload_type == rtp::OPUS { "Opus" } else { "L16" };
                     format!("{codec}, {}", if encrypted { "encrypted" } else { "not encrypted" })
                 });
                 for (sequence, pcm) in &frames {
@@ -340,6 +421,9 @@ fn receive_udp(options: &Options, card: &str, jitter: &Buffers, peak: &AtomicU32
         monitor.tick(jitter, peak);
     }
 }
+
+/// How long the sender being played must be quiet before another one is played instead.
+const SENDER_QUIET: Duration = Duration::from_secs(1);
 
 /// How long to wait before connecting again after the sender's stream ends or can't be reached.
 const RECONNECT_EVERY: Duration = Duration::from_secs(2);
@@ -665,7 +749,6 @@ where
 mod tests {
     use super::Unpacker;
     use crate::rtp;
-    use crate::secure::ReplayWindow;
 
     #[test]
     fn conceals_a_lost_opus_packet() {
@@ -677,13 +760,45 @@ mod tests {
             [&rtp::header(sequence, 0, 9, rtp::OPUS)[..], &out[..len]].concat()
         };
         let (first, _lost, third) = (packet(0), packet(1), packet(2));
-        let mut unpacker = Unpacker { key: None, replay: ReplayWindow::default(), decoder: None, channels: 2, last_opus: None, opus_frame: 960, warned: None };
-        let frames = |u: &mut Unpacker, data: &[u8]| -> Vec<(u16, usize)> {
-            u.unpack(data, &rtp::parse(data).unwrap()).into_iter().map(|(s, pcm)| (s, pcm.len())).collect()
-        };
+        let mut unpacker = Unpacker::new(None, 2);
         assert_eq!(frames(&mut unpacker, &first), [(0, 3840)]);
         // Packet 1 never arrives: it's concealed (same length) right before packet 2.
         assert_eq!(frames(&mut unpacker, &third), [(1, 3840), (2, 3840)]);
+    }
+
+    fn frames(u: &mut Unpacker, data: &[u8]) -> Vec<(u16, usize)> {
+        let packet = rtp::parse(data).unwrap();
+        let Some((payload_type, payload)) = u.open(data, &packet) else { return Vec::new() };
+        u.frames(packet.ssrc, packet.sequence, payload_type, payload).into_iter().map(|(s, pcm)| (s, pcm.len())).collect()
+    }
+
+    #[test]
+    fn late_and_repeated_opus_packets_skip_the_decoder() {
+        let mut encoder = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio).unwrap();
+        let tone: Vec<i16> = vec![0; 960 * 2];
+        let mut out = vec![0u8; 4000];
+        let mut packet = |sequence: u16| {
+            let len = encoder.encode(&tone, &mut out).unwrap();
+            [&rtp::header(sequence, 0, 9, rtp::OPUS)[..], &out[..len]].concat()
+        };
+        let (p10, p11, p12, p13) = (packet(10), packet(11), packet(12), packet(13));
+        let mut unpacker = Unpacker::new(None, 2);
+        assert_eq!(frames(&mut unpacker, &p10), [(10, 3840)]);
+        assert_eq!(frames(&mut unpacker, &p12), [(11, 3840), (12, 3840)]); // 11 concealed
+        assert!(frames(&mut unpacker, &p11).is_empty()); // late: not decoded
+        assert!(frames(&mut unpacker, &p12).is_empty()); // the same again
+        assert_eq!(frames(&mut unpacker, &p13), [(13, 3840)]); // no new concealment for 12
+    }
+
+    #[test]
+    fn only_l16_and_opus_are_played() {
+        let mut unpacker = Unpacker::new(None, 2);
+        let with_type = |pt: u8, payload: &[u8]| [&rtp::header(1, 0, 9, pt)[..], payload].concat();
+        assert_eq!(frames(&mut unpacker, &with_type(rtp::L16, &[0; 960])), [(1, 960)]);
+        assert_eq!(frames(&mut unpacker, &with_type(10, &[0; 960])), [(1, 960)]); // static L16
+        assert!(frames(&mut unpacker, &with_type(0, &[0; 960])).is_empty()); // PCMU
+        assert!(frames(&mut unpacker, &with_type(8, &[0; 960])).is_empty()); // PCMA
+        assert!(frames(&mut unpacker, &with_type(rtp::L16, &[0; 961])).is_empty()); // a broken frame
     }
 
     #[test]
