@@ -2,9 +2,11 @@
 //!
 //! An encrypted packet is an RTP header with payload type 120, an 8-byte packet counter, then
 //! the sealed body: the real payload type (1 byte) followed by the payload, plus a 16-byte tag.
-//! The nonce is SSRC (4 bytes) + counter (8 bytes), so it never repeats for a sender; the header
-//! and counter are authenticated too, so nothing in the packet can be changed. This is
-//! rtp-audio's own format, not SRTP: both ends must be rtp-audio.
+//! The nonce is SSRC (4 bytes) + counter (8 bytes). The counter only grows within a session, and
+//! each session starts with a random SSRC and a random 62-bit counter, so sessions sharing a key
+//! practically never reuse a nonce. The header and counter are authenticated too, so nothing in
+//! the packet can be changed. This is rtp-audio's own format, not SRTP: both ends must be
+//! rtp-audio.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -80,33 +82,52 @@ pub fn generate() -> Result<String, String> {
     Ok(base64_encode(&bytes))
 }
 
-/// Rejects packets seen before (replays) or too old to tell, per sender.
+/// How many senders the replay window remembers at once.
+const SENDERS: usize = 32;
+
+/// Rejects packets seen before (replays) or too old to tell, for each of the last senders: a
+/// recording of an earlier session, mixed in with the current one, can't be played again.
+/// (A receiver started after a session can't tell its recording from a live sender: there is no
+/// handshake. Use a new key to make old recordings useless.)
 #[derive(Default)]
 pub struct ReplayWindow {
-    ssrc: Option<u32>,
+    sessions: Vec<Session>,
+    clock: u64,
+}
+
+struct Session {
+    ssrc: u32,
     highest: u64,
     /// Bit i: counter `highest - i` was seen.
     seen: u64,
+    /// When it was last heard from, to forget the oldest.
+    used: u64,
 }
 
 impl ReplayWindow {
     pub fn accept(&mut self, ssrc: u32, counter: u64) -> bool {
-        if self.ssrc != Some(ssrc) {
-            // A new sender (or the same one restarted): start over.
-            *self = Self { ssrc: Some(ssrc), highest: counter, seen: 1 };
+        self.clock += 1;
+        let Some(session) = self.sessions.iter_mut().find(|s| s.ssrc == ssrc) else {
+            if self.sessions.len() == SENDERS
+                && let Some(oldest) = (0..self.sessions.len()).min_by_key(|&i| self.sessions[i].used)
+            {
+                self.sessions.swap_remove(oldest);
+            }
+            self.sessions.push(Session { ssrc, highest: counter, seen: 1, used: self.clock });
+            return true;
+        };
+        session.used = self.clock;
+        if counter > session.highest {
+            let shift = counter - session.highest;
+            session.seen = if shift >= 64 { 1 } else { (session.seen << shift) | 1 };
+            session.highest = counter;
             return true;
         }
-        if counter > self.highest {
-            let shift = counter - self.highest;
-            self.seen = if shift >= 64 { 1 } else { (self.seen << shift) | 1 };
-            self.highest = counter;
-            return true;
-        }
-        let age = self.highest - counter;
-        if age >= 64 || self.seen & (1 << age) != 0 {
+        let age = session.highest - counter;
+        if age >= 64 || session.seen & (1 << age) != 0 {
             return false;
         }
-        self.seen |= 1 << age;
+        session.seen |= 1 << age;
         true
     }
 }
@@ -199,5 +220,28 @@ mod tests {
         assert!(window.accept(1, 200));
         assert!(!window.accept(1, 100)); // too old to tell
         assert!(window.accept(2, 5)); // another sender starts over
+    }
+
+    #[test]
+    fn replays_from_alternating_sessions_are_rejected() {
+        let mut window = ReplayWindow::default();
+        assert!(window.accept(0xA, 100));
+        assert!(window.accept(0xB, 7));
+        // Recordings of both sessions, played again in turn.
+        assert!(!window.accept(0xA, 100));
+        assert!(!window.accept(0xB, 7));
+        assert!(window.accept(0xA, 101));
+    }
+
+    #[test]
+    fn the_oldest_sender_is_forgotten_first() {
+        let mut window = ReplayWindow::default();
+        for ssrc in 0..SENDERS as u32 {
+            assert!(window.accept(ssrc, 1));
+        }
+        assert!(window.accept(0, 2)); // sender 0 is now the most recent
+        assert!(window.accept(1000, 1)); // makes room by forgetting sender 1
+        assert!(!window.accept(0, 2));
+        assert!(window.accept(1, 1)); // forgotten, so it looks new
     }
 }

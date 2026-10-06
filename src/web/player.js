@@ -172,16 +172,21 @@
       node.port.postMessage([left, right], [left.buffer, right.buffer]);
     };
 
+    // Turned off while waiting (permission, loading, a reconnect): a stopped session must not
+    // open anything more, or it would keep playing and receiving with no button to stop it.
     async function open() {
       context ||= new AudioContext({ sampleRate: RATE, latencyHint: "interactive" });
       if (!node) {
         await context.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" })));
+        if (stopped) return;
         node = new AudioWorkletNode(context, "rtp-audio-player", { outputChannelCount: [2] });
         node.connect(context.destination);
       }
       await context.resume();
+      if (stopped) return;
       const opus = "AudioDecoder" in window &&
         (await AudioDecoder.isConfigSupported({ codec: "opus", sampleRate: RATE, numberOfChannels: 2 }).catch(() => ({}))).supported;
+      if (stopped) return;
       if (opus && !decoder) {
         decoder = new AudioDecoder({
           output: (data) => {
@@ -219,6 +224,8 @@
     }
 
     function fail(err) {
+      // A session already turned off doesn't touch the button, or the session that replaced it.
+      if (stopped) return;
       console.warn("rtp-audio:", err);
       show("warn", `Desktop sound: ${err.message || err} (click to retry)`);
       stop();
@@ -230,7 +237,7 @@
       clearTimeout(retry);
       if (ws) ws.onclose = null, ws.close();
       if (decoder && decoder.state !== "closed") decoder.close();
-      if (context) context.close();
+      if (context && context.state !== "closed") context.close();
     }
 
     open().catch(fail);
@@ -263,9 +270,11 @@
         if (ws) ws.onclose = null, ws.close();
         if (encoder && encoder.state !== "closed") encoder.close();
         if (media) media.getTracks().forEach((t) => t.stop());
-        if (context) context.close();
+        if (context && context.state !== "closed") context.close();
       };
       const fail = (err) => {
+        // A session already turned off doesn't touch the button, or the session that replaced it.
+        if (stopped) return;
         console.warn("rtp-audio mic:", err);
         showMic("warn", `Microphone: ${err.message || err} (click to retry)`);
         stop();
@@ -275,8 +284,11 @@
         media = await navigator.mediaDevices.getUserMedia({
           audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         });
+        // Turned off while the browser asked for permission: let the microphone go at once.
+        if (stopped) return stop();
         context = new AudioContext({ sampleRate: RATE, latencyHint: "interactive" });
         await context.audioWorklet.addModule(URL.createObjectURL(new Blob([MIC_WORKLET], { type: "text/javascript" })));
+        if (stopped) return stop();
         const node = new AudioWorkletNode(context, "rtp-audio-mic", { numberOfInputs: 1, numberOfOutputs: 1 });
         // Keep the node running without playing the microphone back.
         const mute = context.createGain();
@@ -284,6 +296,7 @@
         context.createMediaStreamSource(media).connect(node).connect(mute).connect(context.destination);
         const config = { codec: "opus", sampleRate: RATE, numberOfChannels: 1, bitrate: 64000 };
         const opus = "AudioEncoder" in window && (await AudioEncoder.isConfigSupported(config).catch(() => ({}))).supported;
+        if (stopped) return stop();
         ws = new WebSocket(micUrl + (opus ? "" : "?codec=pcm"));
         ws.binaryType = "arraybuffer";
         if (opus) {
@@ -300,7 +313,9 @@
         node.port.onmessage = ({ data: frame }) => {
           if (stopped || ws.readyState !== WebSocket.OPEN) return;
           if (opus) {
-            encoder.encode(new AudioData({ format: "f32", sampleRate: RATE, numberOfFrames: frame.length, numberOfChannels: 1, timestamp, data: frame }));
+            const audio = new AudioData({ format: "f32", sampleRate: RATE, numberOfFrames: frame.length, numberOfChannels: 1, timestamp, data: frame });
+            encoder.encode(audio);
+            audio.close();
             timestamp += 20000;
           } else {
             const pcm = new Int16Array(frame.length);

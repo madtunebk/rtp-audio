@@ -4,7 +4,6 @@
 use std::error::Error;
 use std::io::{ErrorKind, Read};
 use std::net::{SocketAddr, UdpSocket};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::rtp;
 use crate::secure::Key;
@@ -74,17 +73,26 @@ impl RtpSender {
         };
         let packet_ms = if encoder.is_some() { OPUS_PACKET_MS } else { PCM_PACKET_MS };
         let frames_per_packet = rate * packet_ms / 1000;
-        let ssrc = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) ^ std::process::id();
+        // A random SSRC, and random starting sequence, timestamp and counter (RFC 3550 asks for the
+        // first three). With a key, SSRC + counter is the nonce: random starts keep two sessions
+        // using the same key (restarts, other computers) from ever reusing one.
+        let mut random = [0u8; 18];
+        getrandom::fill(&mut random).map_err(|err| format!("cannot get random bytes: {err}"))?;
+        let ssrc = u32::from_be_bytes(random[0..4].try_into().unwrap());
+        let sequence = u16::from_be_bytes(random[4..6].try_into().unwrap());
+        let timestamp = u32::from_be_bytes(random[6..10].try_into().unwrap());
+        // 62 bits: far from wrapping, however long the session runs.
+        let counter = u64::from_be_bytes(random[10..18].try_into().unwrap()) >> 2;
         Ok(Self {
             socket,
             ssrc,
-            sequence: 0,
-            timestamp: 0,
+            sequence,
+            timestamp,
             channels,
             frames_per_packet,
             encoder,
             key: encoding.key,
-            counter: 0,
+            counter,
             pending: Vec::new(),
             packet_bytes: frames_per_packet as usize * channels * 2,
             opus_out: vec![0; 4000],
@@ -177,6 +185,7 @@ mod tests {
     fn packetizes_into_5_ms_packets() {
         let receiver = receiver();
         let mut sender = RtpSender::connect(receiver.local_addr().unwrap(), 48_000, 2, Encoding::default()).unwrap();
+        let first_sequence = sender.sequence;
         // 1.5 packets in odd-sized pieces: exactly one packet goes out.
         let audio: Vec<u8> = (0..1440).map(|i| i as u8).collect();
         for chunk in audio.chunks(100) {
@@ -185,7 +194,7 @@ mod tests {
         let mut buf = [0u8; 2048];
         let len = receiver.recv(&mut buf).unwrap();
         let packet = rtp::parse(&buf[..len]).unwrap();
-        assert_eq!((packet.sequence, packet.payload_type), (0, rtp::L16));
+        assert_eq!((packet.sequence, packet.payload_type), (first_sequence, rtp::L16));
         assert_eq!(packet.payload, &audio[..960]);
         receiver.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         assert!(receiver.recv(&mut buf).is_err());
@@ -199,14 +208,28 @@ mod tests {
         let mut sender = RtpSender::connect(receiver.local_addr().unwrap(), 48_000, 2, encoding).unwrap();
         sender.push(&vec![0u8; 960 * 4 * 2]).unwrap(); // 40 ms: two packets
         let mut buf = [0u8; 2048];
-        for counter in 1..=2 {
+        let mut counters = Vec::new();
+        for _ in 0..2 {
             let len = receiver.recv(&mut buf).unwrap();
             assert_eq!(buf[1] & 0x7f, secure::PAYLOAD_TYPE);
             let (got, payload_type, payload) = key.open(&buf[..len]).unwrap();
-            assert_eq!((got, payload_type), (counter, rtp::OPUS));
+            assert_eq!(payload_type, rtp::OPUS);
+            counters.push(got);
             let mut decoder = opus::Decoder::new(48_000, opus::Channels::Stereo).unwrap();
             let mut out = vec![0i16; 960 * 2];
             assert_eq!(decoder.decode(&payload, &mut out, false).unwrap(), 960);
         }
+        // Consecutive within the session, from a random start.
+        assert_eq!(counters[1], counters[0] + 1);
+    }
+
+    #[test]
+    fn each_session_starts_somewhere_else() {
+        let receiver = receiver();
+        let to = receiver.local_addr().unwrap();
+        let a = RtpSender::connect(to, 48_000, 2, Encoding::default()).unwrap();
+        let b = RtpSender::connect(to, 48_000, 2, Encoding::default()).unwrap();
+        assert_ne!((a.ssrc, a.counter), (b.ssrc, b.counter));
+        assert!(a.counter < 1 << 62 && b.counter < 1 << 62);
     }
 }
