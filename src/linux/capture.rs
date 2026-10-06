@@ -17,6 +17,8 @@ pub const RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 2;
 /// How much audio the server hands over at a time: 20 ms, small enough for low latency.
 const FRAGMENT_BYTES: u32 = RATE / 1000 * 20 * CHANNELS as u32 * 2;
+/// The longest gap ("hole") in the recording turned into silence: 2 s.
+const MAX_HOLE_BYTES: usize = RATE as usize * 2 * CHANNELS as usize * 2;
 
 pub struct Capture<'a> {
     pulse: &'a Pulse,
@@ -47,6 +49,7 @@ impl<'a> Capture<'a> {
 
             let read_events = events.clone();
             let mut failed = false;
+            let silence = vec![0u8; FRAGMENT_BYTES as usize];
             stream.set_read_callback(Some(Box::new(move |_| {
                 // SAFETY: the callbacks are removed before the boxed stream is dropped, and run
                 // with the main loop lock held, like every other use of the stream.
@@ -54,21 +57,24 @@ impl<'a> Capture<'a> {
                 loop {
                     match stream.peek() {
                         Ok(PeekResult::Empty) => break,
-                        Ok(PeekResult::Hole(_)) => {}
-                        Ok(PeekResult::Data(data)) => {
-                            for sink in &mut sinks {
-                                if !failed && let Err(err) = sink.push(data) {
-                                    failed = true;
-                                    let _ = read_events.send(Event::Network(err));
-                                }
+                        // A gap the server had nothing for: silence as long, so what follows
+                        // keeps its place in time.
+                        Ok(PeekResult::Hole(bytes)) => {
+                            let mut left = bytes.min(MAX_HOLE_BYTES) / 4 * 4;
+                            while left > 0 {
+                                let chunk = left.min(silence.len());
+                                push(&mut sinks, &silence[..chunk], &mut failed, &read_events);
+                                left -= chunk;
                             }
                         }
+                        Ok(PeekResult::Data(data)) => push(&mut sinks, data, &mut failed, &read_events),
                         Err(err) => {
                             let _ = read_events.send(Event::Capture(format!("reading audio failed: {err}")));
                             break;
                         }
                     }
-                    if stream.discard().is_err() {
+                    if let Err(err) = stream.discard() {
+                        let _ = read_events.send(Event::Capture(format!("reading audio failed: {err}")));
                         break;
                     }
                 }
@@ -99,6 +105,16 @@ impl<'a> Capture<'a> {
             }
         });
         stream.map(|stream| Self { pulse, stream: Some(stream) })
+    }
+}
+
+/// Hand `data` to every sink; the first failure ends sending (reported once).
+fn push(sinks: &mut [Box<dyn AudioSink>], data: &[u8], failed: &mut bool, events: &Sender<Event>) {
+    for sink in sinks.iter_mut() {
+        if !*failed && let Err(err) = sink.push(data) {
+            *failed = true;
+            let _ = events.send(Event::Network(err));
+        }
     }
 }
 

@@ -2,12 +2,14 @@
 
 use std::error::Error;
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 
 use libpulse_binding as pa;
 use pa::def::BufferAttr;
 use pa::sample::{Format, Spec};
 use pa::stream::{FlagSet, SeekMode, State, Stream};
 
+use super::Event;
 use super::pulse::Pulse;
 use crate::web::MicFeed;
 
@@ -22,8 +24,9 @@ pub struct Playback<'a> {
 }
 
 impl<'a> Playback<'a> {
-    /// Play whatever the browser sends into `sink`, and silence when nothing comes.
-    pub fn start(pulse: &'a Pulse, sink: &str, feed: Arc<MicFeed>) -> Result<Self, Box<dyn Error>> {
+    /// Play whatever the browser sends into `sink`, and silence when nothing comes. Problems once
+    /// running arrive as `Event::Mic`.
+    pub fn start(pulse: &'a Pulse, sink: &str, feed: Arc<MicFeed>, events: Sender<Event>) -> Result<Self, Box<dyn Error>> {
         let spec = Spec { format: Format::S16le, rate: RATE, channels: 1 };
         let attr = BufferAttr { maxlength: u32::MAX, tlength: TARGET_BYTES, prebuf: u32::MAX, minreq: u32::MAX, fragsize: u32::MAX };
         let wake = pulse.wake();
@@ -31,6 +34,8 @@ impl<'a> Playback<'a> {
             let mut stream = Box::new(Stream::new(context, "RTP Audio Microphone", &spec, None).ok_or("could not create a playback stream")?);
             let raw: *mut Stream = &mut *stream;
             let mut samples = Vec::new();
+            let write_events = events.clone();
+            let mut failed = false;
             stream.set_write_callback(Some(Box::new(move |bytes| {
                 // SAFETY: as in capture.rs, the callbacks are removed before the boxed stream is
                 // dropped, and run with the main loop lock held.
@@ -38,9 +43,20 @@ impl<'a> Playback<'a> {
                 samples.resize(bytes / 2, 0i16);
                 feed.take(&mut samples);
                 let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-                let _ = stream.write_copy(&data, 0, SeekMode::Relative);
+                if let Err(err) = stream.write_copy(&data, 0, SeekMode::Relative)
+                    && !failed
+                {
+                    failed = true;
+                    let _ = write_events.send(Event::Mic(format!("writing to the sound server failed: {err}")));
+                }
             })));
-            stream.set_state_callback(Some(Box::new(move || wake.wake())));
+            stream.set_state_callback(Some(Box::new(move || {
+                // SAFETY: as above.
+                if matches!(unsafe { &*raw }.get_state(), State::Failed | State::Terminated) {
+                    let _ = events.send(Event::Mic("its stream on the sound server stopped".into()));
+                }
+                wake.wake();
+            })));
             let flags = FlagSet::ADJUST_LATENCY | FlagSet::DONT_MOVE;
             let mut result = stream.connect_playback(Some(sink), Some(&attr), flags, None, None).map_err(|err| format!("{err}"));
             while result.is_ok() {

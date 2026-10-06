@@ -72,7 +72,7 @@ pub fn run(
     let mut routing = Routing::new(&pulse, state);
     let result = (|| {
         // The microphone first: with it, a call can start before the sound does.
-        let _mic = mic.map(|feed| start_mic(&pulse, &mut routing, feed)).transpose()?;
+        let _mic = mic.map(|feed| start_mic(&pulse, &mut routing, feed, events.clone())).transpose()?;
         check_interrupted(&stop)?;
         if source.is_some() && routing.mic_feed_is_default()? {
             eprintln!(
@@ -94,10 +94,10 @@ pub fn run(
 }
 
 /// The browser microphone: create "RTP Audio Microphone" and play what browsers send into it.
-fn start_mic<'a>(pulse: &'a Pulse, routing: &mut Routing, feed: Arc<MicFeed>) -> Result<Playback<'a>, Box<dyn Error>> {
+fn start_mic<'a>(pulse: &'a Pulse, routing: &mut Routing, feed: Arc<MicFeed>, events: Sender<Event>) -> Result<Playback<'a>, Box<dyn Error>> {
     let sink = routing.create_mic()?;
     fail_point("mic")?;
-    let playback = Playback::start(pulse, &sink, feed)?;
+    let playback = Playback::start(pulse, &sink, feed, events)?;
     eprintln!("Browser microphone: \"{MIC_NAME}\" is now the default input.");
     Ok(playback)
 }
@@ -175,6 +175,8 @@ fn wait(pulse: &Pulse, stop: &Receiver<Event>, target: &str) -> Result<(), Box<d
         Ok(Event::Network(err)) => Err(format!("sending to {target} failed: {err}").into()),
         Ok(Event::Capture(_)) if !pulse.is_connected() => Err("the connection to the sound server was lost".into()),
         Ok(Event::Capture(err)) => Err(format!("{err} (was the source removed?)").into()),
+        Ok(Event::Mic(_)) if !pulse.is_connected() => Err("the connection to the sound server was lost".into()),
+        Ok(Event::Mic(err)) => Err(format!("the browser microphone stopped: {err}").into()),
     }
 }
 

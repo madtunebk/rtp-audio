@@ -122,7 +122,11 @@ pub fn recover(pulse: &Pulse, path: &Path) -> Result<(), Box<dyn Error>> {
     match State::from_text(&text) {
         Some(state) => {
             eprintln!("Switching back sound left over from a sender that did not stop cleanly");
-            undo(pulse, &state, path)
+            let problems = undo(pulse, &state, path)?;
+            if !problems.is_empty() {
+                eprintln!("Could not switch everything back: {}. Check the sound settings.", problems.join("; "));
+            }
+            Ok(())
         }
         None => {
             eprintln!("Ignoring unreadable {}", path.display());
@@ -207,7 +211,8 @@ impl<'a> Routing<'a> {
         wait_for(|| Ok(self.pulse.sources()?.into_iter().any(|s| s.name == source).then_some(())))?
             .ok_or_else(|| fail("it did not appear".into()))?;
         self.pulse.set_default_source(&source).map_err(fail)?;
-        wait_for(|| Ok((self.pulse.server_info()?.default_source.as_deref() == Some(&source)).then_some(())))?;
+        wait_for(|| Ok((self.pulse.server_info()?.default_source.as_deref() == Some(&source)).then_some(())))?
+            .ok_or_else(|| fail("it did not become the default input".into()))?;
         Ok(feed)
     }
 
@@ -223,10 +228,8 @@ impl<'a> Routing<'a> {
             .map_err(|err| format!("could not make \"{DISPLAY_NAME}\" the default output: {err}"))?;
         // PipeWire confirms before the change shows. Wait for it, or undoing right away would
         // see the old default, leave it, and the late change would then point at a removed sink.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while self.pulse.server_info()?.default_sink.as_deref() != Some(&sink_name) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for(|| Ok((self.pulse.server_info()?.default_sink.as_deref() == Some(&sink_name)).then_some(())))?
+            .ok_or_else(|| format!("\"{DISPLAY_NAME}\" did not become the default output (the sound server accepted, then didn't switch)"))?;
         Ok(())
     }
 
@@ -242,13 +245,15 @@ impl<'a> Routing<'a> {
             if from.index == ours.index || from.name == feed {
                 continue;
             }
+            // Recorded before moving: a crash in between leaves at worst a note about a stream
+            // that didn't move, which undoing skips (it only moves back streams on our output).
+            self.state.moved.push((input.index, from.name.clone()));
+            self.state.save(&self.path)?;
             // Some streams refuse to move; they keep playing where they are.
-            match self.pulse.move_sink_input(input.index, ours.index) {
-                Ok(()) => {
-                    self.state.moved.push((input.index, from.name.clone()));
-                    self.state.save(&self.path)?;
-                }
-                Err(err) => eprintln!("Leaving one stream where it is: {err}"),
+            if let Err(err) = self.pulse.move_sink_input(input.index, ours.index) {
+                eprintln!("Leaving one stream where it is: {err}");
+                self.state.moved.pop();
+                self.state.save(&self.path)?;
             }
         }
         Ok(self.state.moved.len())
@@ -262,11 +267,17 @@ impl<'a> Routing<'a> {
             // The connection broke but the server may still be there: try once more.
             Pulse::connect().and_then(|pulse| undo(&pulse, &self.state, &self.path))
         };
-        if let Err(err) = result {
-            eprintln!(
+        match result {
+            Ok(problems) if problems.is_empty() => {}
+            Ok(problems) => eprintln!(
+                "rtp-audio: removed its outputs, but could not switch everything back: {}.\n  \
+                 Check the sound settings.",
+                problems.join("; ")
+            ),
+            Err(err) => eprintln!(
                 "rtp-audio: could not switch sound back ({err}).\n  \
                  Running rtp-audio send again will finish switching it back."
-            );
+            ),
         }
     }
 }
@@ -286,22 +297,35 @@ fn wait_for<T>(mut check: impl FnMut() -> Result<Option<T>, Box<dyn Error>>) -> 
     }
 }
 
-/// Undo `state` on the server: default output, moved streams, then our module. Each step only
-/// acts if things are still the way we left them, so changes the user made meanwhile stay.
-fn undo(pulse: &Pulse, state: &State, path: &Path) -> Result<(), Box<dyn Error>> {
+/// Undo `state` on the server: default input and output, moved streams, then our modules. Each
+/// step only acts if things are still the way we left them, so changes the user made meanwhile
+/// stay. Errors removing our modules keep the state file, for the next start to retry; problems
+/// switching back (nothing a retry could fix once our modules are gone) come back as a list.
+fn undo(pulse: &Pulse, state: &State, path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut problems = Vec::new();
     let sink_name = state.sink_name();
     let sinks = pulse.sinks()?;
     let mut modules: Vec<Module> = pulse.modules()?.into_iter().filter(|module| state.owns(module)).collect();
     // The microphone's source sits on its feed's monitor: remove it first.
     modules.sort_by_key(|module| module.name != "module-remap-source");
 
+    // Whether the default input / output were ours and could not be given back: once our modules
+    // are gone the server falls back to another device, but keeps remembering ours as the one
+    // chosen. Choosing the fallback explicitly then replaces that stale choice.
+    let mut source_left = false;
+    let mut sink_left = false;
+
     if state.mic && pulse.server_info()?.default_source.as_deref() == Some(&state.mic_source_name()) {
         let sources = pulse.sources()?;
-        if let Some(original) = state.original_default_source.as_ref().and_then(|name| sources.iter().find(|s| &s.name == name)) {
-            match pulse.set_default_source(&original.name) {
+        match state.original_default_source.as_ref().and_then(|name| sources.iter().find(|s| &s.name == name)) {
+            Some(original) => match pulse.set_default_source(&original.name) {
                 Ok(()) => eprintln!("Default input switched back to {}", original.description),
-                Err(err) => eprintln!("Could not switch the default input back: {err}"),
-            }
+                Err(err) => {
+                    problems.push(format!("the default input ({err})"));
+                    source_left = true;
+                }
+            },
+            None => source_left = true,
         }
     }
     // Our sink, recognised by the token in both its name and its properties.
@@ -310,14 +334,16 @@ fn undo(pulse: &Pulse, state: &State, path: &Path) -> Result<(), Box<dyn Error>>
         .find(|sink| sink.name == sink_name && sink.instance.as_deref().is_none_or(|token| token == state.token));
 
     if let Some(ours) = ours {
-        let current_default = pulse.server_info()?.default_sink;
-        let original = state.original_default.as_ref().and_then(|name| sinks.iter().find(|sink| &sink.name == name));
-        if current_default.as_deref() == Some(&sink_name)
-            && let Some(original) = original
-        {
-            match pulse.set_default_sink(&original.name) {
-                Ok(()) => eprintln!("Default output switched back to {}", original.description),
-                Err(err) => eprintln!("Could not switch the default output back: {err}"),
+        if pulse.server_info()?.default_sink.as_deref() == Some(&sink_name) {
+            match state.original_default.as_ref().and_then(|name| sinks.iter().find(|sink| &sink.name == name)) {
+                Some(original) => match pulse.set_default_sink(&original.name) {
+                    Ok(()) => eprintln!("Default output switched back to {}", original.description),
+                    Err(err) => {
+                        problems.push(format!("the default output ({err})"));
+                        sink_left = true;
+                    }
+                },
+                None => sink_left = true,
             }
         }
         let mut moved_back = 0;
@@ -326,7 +352,7 @@ fn undo(pulse: &Pulse, state: &State, path: &Path) -> Result<(), Box<dyn Error>>
             let Some(target) = sinks.iter().find(|sink| &sink.name == from) else { continue };
             match pulse.move_sink_input(input.index, target.index) {
                 Ok(()) => moved_back += 1,
-                Err(err) => eprintln!("Could not move a stream back: {err}"),
+                Err(err) => problems.push(format!("a stream to {} ({err})", target.description)),
             }
         }
         if moved_back > 0 {
@@ -342,9 +368,27 @@ fn undo(pulse: &Pulse, state: &State, path: &Path) -> Result<(), Box<dyn Error>>
     if modules.iter().any(|m| m.name == "module-remap-source") {
         eprintln!("Removed the \"{MIC_NAME}\"");
     }
+    if (sink_left || source_left) && !modules.is_empty() {
+        settle_defaults(pulse, sink_left, source_left);
+    }
     match std::fs::remove_file(path) {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
-        _ => Ok(()),
+        _ => Ok(problems),
+    }
+}
+
+/// After removing our devices while they were the defaults, with nothing to switch back to (or
+/// switching back failed): choose the device the server fell back to, so its remembered choice
+/// no longer names a device that's gone.
+fn settle_defaults(pulse: &Pulse, sink: bool, source: bool) {
+    // The server picks the fallback a moment after the device goes.
+    std::thread::sleep(Duration::from_millis(200));
+    let Ok(info) = pulse.server_info() else { return };
+    if sink && let Some(fallback) = info.default_sink {
+        let _ = pulse.set_default_sink(&fallback);
+    }
+    if source && let Some(fallback) = info.default_source {
+        let _ = pulse.set_default_source(&fallback);
     }
 }
 

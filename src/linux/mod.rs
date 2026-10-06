@@ -15,6 +15,8 @@ pub enum Event {
     Signal,
     Capture(String),
     Network(std::io::Error),
+    /// Playing the browser's microphone into its feed failed.
+    Mic(String),
 }
 
 /// `rtp-audio sources`: works while a sender is running, as it takes no lock.
