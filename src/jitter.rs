@@ -37,6 +37,8 @@ pub struct Stats {
     pub underruns: u64,
     /// Times the buffer overfilled and old sound was skipped.
     pub trimmed: u64,
+    /// Times the sound card itself reported a problem (an underrun or overrun).
+    pub card: u64,
 }
 
 impl Jitter {

@@ -355,11 +355,11 @@ fn pick_devices(wanted: &[String]) -> Result<Vec<cpal::Device>, Box<dyn Error>> 
     Ok(devices)
 }
 
-/// How much a card opened directly (ALSA hw:) is asked for at a time: 10 ms. Left to itself,
-/// ALSA can pick seconds, which the jitter buffer can't keep level with. Outputs that go through
-/// a sound server (PipeWire, PulseAudio, the default) keep their own sizes: 10 ms is too tight
-/// for them and runs them dry.
-const CARD_PERIOD_MS: u32 = 10;
+/// How much a card opened directly (ALSA hw:) is asked for at a time: 20 ms. Left to itself,
+/// ALSA can pick seconds, which the jitter buffer can't keep level with; 10 ms was too tight for a
+/// card playing next to other outputs. Outputs that go through a sound server (PipeWire,
+/// PulseAudio, the default) keep their own sizes: a short period runs them dry.
+const CARD_PERIOD_MS: u32 = 20;
 
 /// Start playing on `device`; returns the stream and a description of it.
 fn open_output(device: &cpal::Device, out: Output) -> Result<(cpal::Stream, String), Box<dyn Error>> {
@@ -421,6 +421,7 @@ impl Buffers {
             stats.late = stats.late.max(s.late);
             stats.underruns = stats.underruns.max(s.underruns);
             stats.trimmed = stats.trimmed.max(s.trimmed);
+            stats.card = stats.card.max(s.card);
             buffered = buffered.min(jitter.buffered());
         }
         (stats, if buffered == usize::MAX { 0 } else { buffered })
@@ -444,7 +445,7 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
         let out = Output { jitter: Arc::clone(&jitter), peak: Arc::clone(&peak), volume: options.volume, input_rate: options.rate };
         match open_output(&device, out) {
             Ok((stream, card)) => {
-                cards.push(card);
+                cards.push((device_name(&device), card));
                 buffers.push(jitter);
                 streams.push(stream);
             }
@@ -459,7 +460,11 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     if streams.is_empty() {
         return Err(first_error.unwrap_or_else(|| "no output could be opened".into()));
     }
-    let card = if cards.len() == 1 { format!("sound card: {}", cards[0]) } else { format!("{} sound cards: {}", cards.len(), cards.join("; ")) };
+    // One output: its details. Several: just their names, on one short line.
+    let card = match cards.as_slice() {
+        [(_, details)] => format!("sound card: {details}"),
+        _ => format!("playing on {} outputs: {}", cards.len(), cards.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", ")),
+    };
     let jitter = Buffers(buffers);
     let mut monitor = Monitor::new(options.rate);
     match &options.url {
@@ -771,7 +776,11 @@ fn status_line(sender: Option<&str>, waiting: bool, rate: f32, buffer_ms: usize,
         Some(from) => {
             let db = 20.0 * level.max(1e-6).log10();
             let bars = (((db + 60.0) / 60.0).clamp(0.0, 1.0) * 20.0).round() as usize;
-            let problems = (now.lost - since.lost) + (now.late - since.late) + (now.underruns - since.underruns) + (now.trimmed - since.trimmed);
+            let problems = (now.lost - since.lost)
+                + (now.late - since.late)
+                + (now.underruns - since.underruns)
+                + (now.trimmed - since.trimmed)
+                + (now.card - since.card);
             format!(
                 "{from}  {rate:>3.0} pkt/s  buffer {buffer_ms:>3} ms  {}  [{}{}] {:>4}",
                 if problems > 0 { format!("{problems} problem(s) just now") } else { "ok".to_string() },
@@ -794,6 +803,7 @@ fn report(before: &Stats, now: &Stats) {
         (now.late - before.late, "packets arrived too late"),
         (now.underruns - before.underruns, "dropouts (packets came too slowly: try a bigger --latency)"),
         (now.trimmed - before.trimmed, "skips (packets came in a burst)"),
+        (now.card - before.card, "sound card underruns or overruns"),
     ] {
         if count > 0 {
             parts.push(format!("{count} {what}"));
@@ -872,6 +882,9 @@ where
     let channels = config.channels as usize;
     let mut player = Player::new(out.input_rate, config.sample_rate);
     let Output { jitter, peak, volume, .. } = out;
+    let errors = Arc::clone(&jitter);
+    let name = device_name(device);
+    let mut shown = false;
     let stream = device.build_output_stream(
         *config,
         move |data: &mut [T], _| {
@@ -896,8 +909,15 @@ where
             // Positive f32s order like their bits, so fetch_max keeps the loudest.
             peak.fetch_max(loudest.to_bits(), Ordering::Relaxed);
         },
-        // On a line of its own, not glued to the end of the live status line.
-        |err| eprintln!("\r{:width$}\rsound card: {err}", "", width = STATUS_WIDTH),
+        // Counted with the other problems (status line, reports); only the first is spelled out,
+        // on a line of its own, so a card that keeps hiccuping doesn't flood the terminal.
+        move |err| {
+            errors.lock().unwrap().stats.card += 1;
+            if !shown {
+                shown = true;
+                eprintln!("\r{:width$}\r{name}: {err} (further ones are counted as problems)", "", width = STATUS_WIDTH);
+            }
+        },
         None,
     )?;
     Ok(stream)
