@@ -1,7 +1,25 @@
 # Troubleshooting
 
 **Crackles or dropouts.** Give the receiver a bigger buffer, e.g. `rtp-audio --latency 120`.
-Every few seconds the receiver prints what went wrong (lost packets, dropouts, skips).
+Every few seconds the receiver prints what went wrong (lost packets, dropouts, skips, sound card
+underruns).
+
+**The sound cuts out regularly, every minute or so.** Something may keep restarting the sound
+server on the sending desktop. Check with
+`journalctl --user -u pipewire --since "-10min" | grep -E "Started|Stopped"`. One cause seen on
+Ubuntu 26.04: a VNC server set to start GNOME, which can't run there (GNOME 50 has no X11
+session), so it fails, restarts, and takes PipeWire down each time. Use XFCE (or another X11
+desktop) in the VNC server; GNOME is reached through its own RDP.
+
+**"Ignoring sound from …: already playing …".** Two senders are sending to the same receiver.
+It keeps playing the first, and takes the other over once the first has been quiet for a second.
+
+**"several outputs are called …".** Two outputs share that name (e.g. two HDMI ports to the same
+monitor model): pass the ID the message lists, e.g. `--device alsa:hw:CARD=NVidia,DEV=7`.
+
+**"The requested device is temporarily busy" with an `alsa:hw:…` output.** A card opened directly
+takes one program at a time, and the sound server is probably using it. Pick the default output,
+or the PipeWire/PulseAudio one, instead.
 
 **No sound, and the receiver never prints `Receiving from ...`.** Check that the sender uses
 the receiver's address and port, that both are on the same LAN or VPN, and that the receiver's

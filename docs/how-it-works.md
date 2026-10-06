@@ -22,5 +22,17 @@ arrive late and in bursts; the buffer then drops the oldest sound so the delay s
 buffer size. The sender encodes once for every browser and TCP receiver, and gives each a short
 queue, so one slow listener misses frames without holding back the others.
 
+The receiver plays one sender at a time, by address and SSRC; another is taken over after a
+second of quiet, with the buffer and the decoder started afresh. It plays L16 (payload types
+10, 11 and 96–127) and Opus, and ignores other codecs. With several outputs, each has its own
+jitter buffer and resampler fed with the same sound; cards opened directly (ALSA `hw:`) are asked
+for 20 ms periods.
+
+**Encryption.** Each sender session starts with a random SSRC, sequence, timestamp and 62-bit
+packet counter, and SSRC + counter is the ChaCha20-Poly1305 nonce, so sessions sharing a key
+practically never reuse a nonce. The receiver keeps a replay window for each of the last 32
+senders. There is no handshake, so a receiver started later can't tell a recording of an earlier
+session from a live sender: change the key to make old recordings useless.
+
 It also plays standard RTP L16 streams (PulseAudio `module-rtp-send`, PipeWire `module-rtp-sink`,
 `ffmpeg -f rtp -acodec pcm_s16be`) at 48 kHz stereo.

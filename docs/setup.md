@@ -31,6 +31,19 @@ sudo ufw allow 46000/udp   # only if you use the ufw firewall
 
 It prints `Listening on UDP port 46000` and, once sound arrives, `Receiving from ...`.
 
+It plays on the default output. To choose another one, or several at once, list them and pass
+`--device` once, with the outputs separated by commas:
+
+```bash
+./rtp-audio devices
+./rtp-audio --device "ALC897 Analog"                    # one output, by (part of) its name
+./rtp-audio --device "alsa:default, ALC897 Analog"     # the same sound on two outputs
+```
+
+A name that several outputs share (two HDMI ports to the same monitor model) needs the ID from the
+list. Each output keeps its own buffer, since every sound card runs on its own clock; one that
+won't open is skipped, the others still play.
+
 ## 2. Find the receiver's IP address
 
 - Windows: `ipconfig`
@@ -155,9 +168,9 @@ install command tells you when that's needed. No other part of rtp-audio runs ex
 ## All options
 
 ```
-rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME_OR_ID] [--volume 100]
+rtp-audio [receive] [--port 46000] [--latency 60] [--device 'NAME_OR_ID, …'] [--volume 100]
                     [--key-file FILE] [--group 239.255.46.1] [--no-discovery]
-rtp-audio [receive] ws://HOST:PORT [--latency 60] [--device NAME_OR_ID] [--volume 100]   # over TCP
+rtp-audio [receive] ws://HOST:PORT [--latency 60] [--device 'NAME_OR_ID, …'] [--volume 100]   # over TCP
 rtp-audio find [--port 46000]                                     # receivers on this network
 rtp-audio devices                                                 # outputs for --device
 rtp-audio keygen                                                  # a key for --key / --key-file
@@ -168,7 +181,12 @@ rtp-audio send --web 46080 [--mic] [HOST:PORT]                   # sound (and mi
 rtp-audio service install SEND_OPTIONS | uninstall | status | start | stop | restart
 ```
 
-`--latency` is the receiver's buffer in milliseconds, `--volume` is in percent (0–400). In a
-terminal, the receiver shows a live status line: packets per second, how full its buffer is,
-problems in the last few seconds, and a level meter of what arrives. Something went wrong? See
-[troubleshooting](troubleshooting.md).
+`--latency` is the receiver's buffer in milliseconds (20–2000), `--volume` is in percent
+(0–400), `--rate` is 8000–192000 Hz. In a terminal, the receiver shows a live status line:
+packets per second, how full its buffer is, problems in the last few seconds, and a level meter
+of what arrives. Something went wrong? See [troubleshooting](troubleshooting.md).
+
+A receiver plays one sender at a time: while one plays, sound from another is ignored (it says
+so), and the other is taken over once the first has been quiet for a second. `--stdin` sends at
+the pace the audio plays, so a file goes out as it would sound, not all at once. IPv6 works too:
+`rtp-audio send '[2001:db8::20]:46000'` and `rtp-audio ws://[::1]:46080` (addresses in brackets).
