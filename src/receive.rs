@@ -355,19 +355,22 @@ fn pick_devices(wanted: &[String]) -> Result<Vec<cpal::Device>, Box<dyn Error>> 
     Ok(devices)
 }
 
-/// How much each sound card asks for at a time: 10 ms. Left to itself, ALSA can pick seconds for
-/// a card opened directly (hw:), which the jitter buffer can't keep level with.
+/// How much a card opened directly (ALSA hw:) is asked for at a time: 10 ms. Left to itself,
+/// ALSA can pick seconds, which the jitter buffer can't keep level with. Outputs that go through
+/// a sound server (PipeWire, PulseAudio, the default) keep their own sizes: 10 ms is too tight
+/// for them and runs them dry.
 const CARD_PERIOD_MS: u32 = 10;
 
 /// Start playing on `device`; returns the stream and a description of it.
 fn open_output(device: &cpal::Device, out: Output) -> Result<(cpal::Stream, String), Box<dyn Error>> {
     let supported = device.default_output_config()?;
     let format = supported.sample_format();
+    let direct = alsa_port(&device_id(device)).is_some_and(|port| port.plugin == "hw");
     let buffer_size = match supported.buffer_size() {
-        cpal::SupportedBufferSize::Range { min, max } => {
+        cpal::SupportedBufferSize::Range { min, max } if direct => {
             cpal::BufferSize::Fixed((supported.sample_rate() * CARD_PERIOD_MS / 1000).clamp(*min, *max))
         }
-        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+        _ => cpal::BufferSize::Default,
     };
     let mut config: StreamConfig = supported.into();
     config.buffer_size = buffer_size;
@@ -893,7 +896,8 @@ where
             // Positive f32s order like their bits, so fetch_max keeps the loudest.
             peak.fetch_max(loudest.to_bits(), Ordering::Relaxed);
         },
-        |err| eprintln!("sound card: {err}"),
+        // On a line of its own, not glued to the end of the live status line.
+        |err| eprintln!("\r{:width$}\rsound card: {err}", "", width = STATUS_WIDTH),
         None,
     )?;
     Ok(stream)
