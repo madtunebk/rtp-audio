@@ -251,15 +251,38 @@ impl Pulse {
     }
 
     pub fn set_default_sink(&self, name: &str) -> Result<(), Box<dyn Error>> {
-        self.act(&format!("making {name} the default output"), |context, reply| {
+        self.act_when_ready(&format!("making {name} the default output"), |context, reply| {
             context.set_default_sink(name, move |ok| reply.send(ok))
         })
     }
 
     pub fn set_default_source(&self, name: &str) -> Result<(), Box<dyn Error>> {
-        self.act(&format!("making {name} the default input"), |context, reply| {
+        self.act_when_ready(&format!("making {name} the default input"), |context, reply| {
             context.set_default_source(name, move |ok| reply.send(ok))
         })
+    }
+
+    /// Like `act`, for changes that need PipeWire's session manager (WirePlumber), which keeps the
+    /// defaults. When the sound server was only just started for us (no one logged in to the
+    /// desktop yet), the session manager takes a moment to come up, and until then the server
+    /// answers "Not supported": wait for it a few seconds before giving up.
+    fn act_when_ready<C: ?Sized>(
+        &self,
+        what: &str,
+        start: impl Fn(&mut Context, Reply<bool>) -> Operation<C>,
+    ) -> Result<(), Box<dyn Error>> {
+        let not_supported = pa::error::PAErr::from(pa::error::Code::NotSupported).0.abs();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if self.request(what, &start)? {
+                return Ok(());
+            }
+            let errno = self.locked(|_, context| context.errno());
+            if errno.0.abs() != not_supported || std::time::Instant::now() >= deadline {
+                return Err(format!("{what} failed: {errno}").into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     pub fn move_sink_input(&self, input: u32, sink: u32) -> Result<(), Box<dyn Error>> {
