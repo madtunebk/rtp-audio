@@ -7,6 +7,10 @@
   window.rtpAudioPlayer = true;
 
   const RATE = 48000;
+  // Frames waiting in a decoder or encoder before new ones are dropped (10 = 200 ms).
+  const MAX_BACKLOG = 10;
+  // Microphone bytes waiting to go out before new frames are dropped (about 2 s of Opus).
+  const MAX_UPLINK = 16 * 1024;
   const base = new URL(".", document.currentScript.src);
   const wsUrl = new URL("ws", base);
   wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
@@ -125,7 +129,7 @@
 
   let session = null;
   // For troubleshooting from the browser console.
-  const stats = (window.rtpAudio = { received: 0, decoded: 0, level: 0, codec: null });
+  const stats = (window.rtpAudio = { received: 0, decoded: 0, skipped: 0, level: 0, codec: null });
 
   button.addEventListener("click", () => {
     if (session) { session.stop(); session = null; show("off", "Desktop sound: off (click to turn on)"); }
@@ -206,6 +210,8 @@
         if (typeof event.data === "string") return;
         stats.received++;
         if (opus) {
+          // A decoder this far behind (a busy tab): drop frames rather than play old sound later.
+          if (decoder.decodeQueueSize > MAX_BACKLOG) { stats.skipped++; timestamp += 20000; return; }
           decoder.decode(new EncodedAudioChunk({ type: "key", timestamp, data: event.data }));
           timestamp += 20000;
         } else {
@@ -255,7 +261,7 @@
     const mic = micControl.el;
     const showMic = (state, title) => micControl.set(state, title);
     showMic("off", "Microphone: off (click to send your microphone to the desktop)");
-    stats.mic = { sent: 0 };
+    stats.mic = { sent: 0, dropped: 0 };
     let micSession = null;
     mic.addEventListener("click", () => {
       if (micSession) { micSession.stop(); micSession = null; showMic("off", "Microphone: off (click to send your microphone to the desktop)"); }
@@ -312,6 +318,11 @@
         }
         node.port.onmessage = ({ data: frame }) => {
           if (stopped || ws.readyState !== WebSocket.OPEN) return;
+          // A slow uplink or encoder: drop frames, so the desktop hears you now, not seconds later.
+          if (ws.bufferedAmount > MAX_UPLINK || (opus && encoder.encodeQueueSize > MAX_BACKLOG)) {
+            stats.mic.dropped++;
+            return;
+          }
           if (opus) {
             const audio = new AudioData({ format: "f32", sampleRate: RATE, numberOfFrames: frame.length, numberOfChannels: 1, timestamp, data: frame });
             encoder.encode(audio);

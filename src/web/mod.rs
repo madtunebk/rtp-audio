@@ -3,7 +3,6 @@
 //! login (see docs/web.md):
 //!
 //!   GET /player.js   the player: adds a sound button to the page that loads it
-//!   GET /            a bare page with just the player, for testing
 //!   GET /ws          the WebSocket: one text message describing the stream, then one binary
 //!                    message per 20 ms frame (Opus, or s16le PCM with ?codec=pcm)
 //!   GET /config.json what the player may offer: {"mic": true} with `send --web … --mic`
@@ -13,11 +12,12 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Bytes, Message};
 
 use crate::transport::AudioSink;
@@ -30,6 +30,16 @@ const FRAME_SAMPLES: usize = RATE as usize / 50 * CHANNELS;
 /// slowing down everyone else.
 const QUEUE: usize = 25;
 const BITRATE: i32 = 128_000;
+/// Connections served at once (listeners, microphone and plain requests): each has a thread.
+const MAX_CONNECTIONS: usize = 32;
+/// A listener that takes longer than this to accept a frame is gone or hopelessly behind.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// With no sound to send, ping this often: proxies keep the connection, gone browsers show up.
+const PING_EVERY: Duration = Duration::from_secs(1);
+/// A microphone sends a frame every 20 ms; this long without anything means the browser is gone.
+const MIC_IDLE: Duration = Duration::from_secs(10);
+/// The largest WebSocket message taken from a browser: a 20 ms microphone frame is under 2 KB.
+const MAX_MESSAGE: usize = 16 * 1024;
 const PLAYER: &str = include_str!("player.js");
 
 #[derive(Clone, Copy, PartialEq)]
@@ -92,6 +102,8 @@ const MIC_MAX: usize = 12_000;
 
 impl MicFeed {
     fn push(&self, samples: &[i16]) {
+        // Only the newest MIC_MAX samples can stay: don't copy more than that in.
+        let samples = &samples[samples.len().saturating_sub(MIC_MAX)..];
         let mut queue = self.queue.lock().unwrap();
         queue.samples.extend(samples);
         let excess = queue.samples.len().saturating_sub(MIC_MAX);
@@ -133,11 +145,18 @@ pub fn start(address: SocketAddr, mic: Option<Arc<MicFeed>>) -> Result<WebSink, 
     let listener = TcpListener::bind(address).map_err(|err| format!("cannot listen on {address}: {err}"))?;
     let hub = Arc::new(Hub::default());
     let server_hub = Arc::clone(&hub);
+    let connections = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
+        for mut stream in listener.incoming().flatten() {
+            if connections.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                continue;
+            }
+            let count = Count::new(&connections);
             let hub = Arc::clone(&server_hub);
             let mic = mic.clone();
             std::thread::spawn(move || {
+                let _count = count;
                 if let Err(err) = serve(stream, &hub, mic.as_deref()) {
                     eprintln!("Web listener: {err}");
                 }
@@ -197,16 +216,26 @@ fn serve(mut stream: TcpStream, hub: &Hub, mic: Option<&MicFeed>) -> Result<(), 
         let codec = if path.contains("codec=pcm") { Codec::Pcm } else { Codec::Opus };
         // Frames are small and every 20 ms: send each at once rather than gathering them.
         stream.set_nodelay(true)?;
-        let mut socket = tungstenite::accept(stream)?;
-        socket.get_mut().set_read_timeout(None)?;
+        // A few seconds of sound at most waiting in the kernel: a browser that stops reading then
+        // fills it soon, and the write timeout notices, instead of after megabytes.
+        let _ = socket2::SockRef::from(&stream).set_send_buffer_size(64 * 1024);
+        let mut socket = tungstenite::accept_with_config(stream, Some(small_messages()))?;
+        // Reads only look for what the browser sends back (Close, Ping), never wait for it.
+        socket.get_mut().set_read_timeout(Some(Duration::from_millis(1)))?;
+        socket.get_mut().set_write_timeout(Some(WRITE_TIMEOUT))?;
         let name = if codec == Codec::Opus { "opus" } else { "pcm" };
         socket.send(Message::text(format!(
             r#"{{"codec":"{name}","sampleRate":{RATE},"channels":{CHANNELS},"frameMs":20}}"#
         )))?;
         let frames = hub.join(codec);
-        // Ends when the browser goes away (the send fails) or the sender stops.
-        while let Ok(frame) = frames.recv() {
-            if socket.send(Message::Binary(frame)).is_err() {
+        // Ends when the browser closes or goes away (a send fails or times out), or the sender stops.
+        loop {
+            let sent = match frames.recv_timeout(PING_EVERY) {
+                Ok(frame) => socket.send(Message::Binary(frame)),
+                Err(RecvTimeoutError::Timeout) => socket.send(Message::Ping(Bytes::new())),
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            if sent.is_err() || browser_closed(&mut socket) {
                 break;
             }
         }
@@ -218,8 +247,9 @@ fn serve(mut stream: TcpStream, hub: &Hub, mic: Option<&MicFeed>) -> Result<(), 
     {
         {
             let pcm = path.contains("codec=pcm");
-            let mut socket = tungstenite::accept(stream)?;
-            socket.get_mut().set_read_timeout(None)?;
+            let mut socket = tungstenite::accept_with_config(stream, Some(small_messages()))?;
+            socket.get_mut().set_read_timeout(Some(MIC_IDLE))?;
+            socket.get_mut().set_write_timeout(Some(WRITE_TIMEOUT))?;
             if mic.busy.swap(true, Ordering::SeqCst) {
                 let _ = socket.close(Some(tungstenite::protocol::CloseFrame {
                     code: tungstenite::protocol::frame::coding::CloseCode::Policy,
@@ -228,10 +258,9 @@ fn serve(mut stream: TcpStream, hub: &Hub, mic: Option<&MicFeed>) -> Result<(), 
                 let _ = socket.flush();
                 return Ok(());
             }
-            let result = receive_mic(&mut socket, mic, pcm);
-            mic.clear();
-            mic.busy.store(false, Ordering::SeqCst);
-            return result;
+            // Free the microphone however this ends.
+            let _slot = MicSlot(mic);
+            return receive_mic(&mut socket, mic, pcm);
         }
     }
 
@@ -253,6 +282,52 @@ fn serve(mut stream: TcpStream, hub: &Hub, mic: Option<&MicFeed>) -> Result<(), 
     Ok(())
 }
 
+/// Counts a connection while it lives.
+struct Count(Arc<AtomicUsize>);
+
+impl Count {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Count(Arc::clone(count))
+    }
+}
+
+impl Drop for Count {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The microphone in use by one browser: free again when this is dropped.
+struct MicSlot<'a>(&'a MicFeed);
+
+impl Drop for MicSlot<'_> {
+    fn drop(&mut self) {
+        self.0.clear();
+        self.0.busy.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Browsers only send small messages: a big one is refused before it takes memory.
+fn small_messages() -> WebSocketConfig {
+    WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE))
+}
+
+/// Read what a listening browser sent back, without waiting: true once it closed or went away.
+/// A Ping gets its Pong with the next frame sent.
+fn browser_closed(socket: &mut tungstenite::WebSocket<TcpStream>) -> bool {
+    loop {
+        match socket.read() {
+            Ok(Message::Close(_)) => return true,
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(err)) if matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                return false;
+            }
+            Err(_) => return true,
+        }
+    }
+}
+
 /// Feed one browser's microphone into `mic` until it disconnects.
 fn receive_mic(socket: &mut tungstenite::WebSocket<TcpStream>, mic: &MicFeed, pcm: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut decoder = opus::Decoder::new(RATE, opus::Channels::Mono)?;
@@ -261,6 +336,10 @@ fn receive_mic(socket: &mut tungstenite::WebSocket<TcpStream>, mic: &MicFeed, pc
     loop {
         match socket.read() {
             Ok(Message::Binary(data)) if pcm => {
+                if data.len() % 2 != 0 {
+                    eprintln!("Browser microphone: ignoring a PCM frame of odd length");
+                    continue;
+                }
                 let frame: Vec<i16> = data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
                 mic.push(&frame);
             }
