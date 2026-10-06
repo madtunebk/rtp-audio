@@ -10,3 +10,6 @@
 # Maintainer-only notes, kept offline.
 /docs/releasing.md
 /notes-*.md
+
+# Local audit reports and the fixes log: not part of the repository.
+/progress/
