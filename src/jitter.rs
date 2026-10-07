@@ -134,6 +134,12 @@ impl Player {
             if jitter.frames.len() < jitter.target {
                 return [0.0; 2];
             }
+            // Start exactly at the target: sound gathered while the output was still opening would
+            // otherwise take its time to play off (at 0.5% faster), leaving this output late,
+            // and behind the others when there are several.
+            // (Two at least: playing interpolates between neighbouring frames.)
+            let excess = jitter.frames.len() - jitter.target.max(2).min(jitter.frames.len());
+            jitter.frames.drain(..excess);
             jitter.playing = true;
             self.position = 0.0;
         }
@@ -183,6 +189,14 @@ mod tests {
         assert_eq!((jitter.stats.lost, jitter.stats.late), (1, 1));
         jitter.push(5000, &packet(1, 3), 2); // sender restarted
         assert_eq!(jitter.frames.len(), 3);
+    }
+
+    #[test]
+    fn starts_at_the_target_whatever_gathered_before() {
+        let mut jitter = Jitter::new(4);
+        jitter.push(0, &packet(100, 10), 2); // 10 frames gathered while the output was opening
+        Player::new(48_000, 48_000).next_frame(&mut jitter);
+        assert!(jitter.buffered() <= 4);
     }
 
     #[test]

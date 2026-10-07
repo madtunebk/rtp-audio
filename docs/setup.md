@@ -41,7 +41,13 @@ It plays on the default output. To choose another one, or several at once, list 
 ```
 
 A name that several outputs share (two HDMI ports to the same monitor model) needs the ID from the
-list. Each output keeps its own buffer, since every sound card runs on its own clock; one that
+list. If one output sounds behind or ahead of the others (Bluetooth and TVs add their own delay),
+give the earlier ones a delay, in milliseconds, to line them up by ear:
+
+```bash
+./rtp-audio --device "HDMI 2+120ms, Bose"
+```
+ Each output keeps its own buffer, since every sound card runs on its own clock; one that
 won't open is skipped, the others still play.
 
 ## 2. Find the receiver's IP address

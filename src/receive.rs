@@ -310,9 +310,9 @@ fn pick_device(wanted: Option<&str>) -> Result<cpal::Device, Box<dyn Error>> {
 /// can contain commas themselves ("HD-Audio Generic, ALC897 Analog", alsa:hw:CARD=Generic,DEV=0),
 /// so the list is read left to right, taking each time the longest run of comma-separated parts
 /// that is exactly an output's name or ID, else one part as (part of) a name.
-fn pick_devices(wanted: &[String]) -> Result<Vec<cpal::Device>, Box<dyn Error>> {
+fn pick_devices(wanted: &[String]) -> Result<Vec<(cpal::Device, u32)>, Box<dyn Error>> {
     if wanted.is_empty() {
-        return Ok(vec![pick_device(None)?]);
+        return Ok(vec![(pick_device(None)?, 0)]);
     }
     let outputs = outputs()?;
     // An exact ID, or a name only one output has (a shared name is left to pick_device, which
@@ -333,19 +333,22 @@ fn pick_devices(wanted: &[String]) -> Result<Vec<cpal::Device>, Box<dyn Error>> 
         if outputs.iter().filter(|o| o.name.eq_ignore_ascii_case(value.trim())).count() > 1 {
             pick_device(Some(value.trim()))?;
         }
-        let parts: Vec<&str> = value.split(',').collect();
+        // Each part may end with a delay for its output ("Bose+180ms"); the delay of an output whose
+        // name spans several parts is the last part's.
+        let parts: Vec<(&str, u32)> = value.split(',').map(split_delay).collect::<Result<_, _>>()?;
         let mut i = 0;
         while i < parts.len() {
-            let longest = (i + 1..=parts.len()).rev().find_map(|j| exact(parts[i..j].join(",").trim()).map(|k| (j, k)));
+            let joined = |j: usize| parts[i..j].iter().map(|(text, _)| *text).collect::<Vec<_>>().join(",");
+            let longest = (i + 1..=parts.len()).rev().find_map(|j| exact(joined(j).trim()).map(|k| (j, k)));
             match longest {
                 Some((j, k)) => {
-                    devices.push(outputs[k].device.clone());
+                    devices.push((outputs[k].device.clone(), parts[j - 1].1));
                     i = j;
                 }
                 None => {
-                    let part = parts[i].trim();
+                    let (part, delay) = (parts[i].0.trim(), parts[i].1);
                     if !part.is_empty() {
-                        devices.push(pick_device(Some(part))?);
+                        devices.push((pick_device(Some(part))?, delay));
                     }
                     i += 1;
                 }
@@ -354,11 +357,31 @@ fn pick_devices(wanted: &[String]) -> Result<Vec<cpal::Device>, Box<dyn Error>> 
     }
     // The same output named twice would play the sound twice, slightly apart.
     let mut seen = std::collections::HashSet::new();
-    devices.retain(|device| seen.insert(device_id(device)));
+    devices.retain(|(device, _)| seen.insert(device_id(device)));
     if devices.is_empty() {
         return Err("--device names no output; see `rtp-audio devices`".into());
     }
     Ok(devices)
+}
+
+/// The longest delay an output can be given, to line it up with slower ones.
+const MAX_DELAY_MS: u32 = 2_000;
+
+/// One part of the --device list and its delay: "Bose+180ms" → ("Bose", 180), "HDMI" → ("HDMI", 0).
+fn split_delay(part: &str) -> Result<(&str, u32), String> {
+    let trimmed = part.trim_end();
+    if let Some(number) = trimmed.strip_suffix("ms")
+        && let Some((name, ms)) = number.rsplit_once('+')
+        && !ms.trim().is_empty()
+        && ms.trim().chars().all(|c| c.is_ascii_digit())
+    {
+        let ms: u32 = ms.trim().parse().map_err(|_| format!("bad delay in '{part}'"))?;
+        if ms > MAX_DELAY_MS {
+            return Err(format!("the delay in '{}' must be at most {MAX_DELAY_MS} ms", part.trim()));
+        }
+        return Ok((name.trim_end(), ms));
+    }
+    Ok((part, 0))
 }
 
 /// How much a card opened directly (ALSA hw:) is asked for at a time: 20 ms. Left to itself,
@@ -452,12 +475,15 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let devices = pick_devices(&options.devices)?;
     let several = devices.len() > 1;
     let mut first_error = None;
-    for device in devices {
-        let jitter = Arc::new(Mutex::new(Jitter::new(target)));
+    for (device, delay_ms) in devices {
+        // A delayed output keeps that much more sound buffered, so it plays that much later.
+        let delayed = target + (u64::from(options.rate) * u64::from(delay_ms) / 1000) as usize;
+        let jitter = Arc::new(Mutex::new(Jitter::new(delayed)));
         let out = Output { jitter: Arc::clone(&jitter), peak: Arc::clone(&peak), volume: options.volume, input_rate: options.rate };
         match open_output(&device, out) {
             Ok((stream, card)) => {
-                cards.push((device_name(&device), card));
+                let delay = if delay_ms > 0 { format!(" +{delay_ms} ms") } else { String::new() };
+                cards.push((format!("{}{delay}", device_name(&device)), format!("{card}{delay}")));
                 buffers.push((short_name(&device_name(&device)), jitter));
                 streams.push(stream);
             }
@@ -1082,6 +1108,15 @@ mod tests {
         assert!(frames(&mut unpacker, &with_type(0, &[0; 960])).is_empty()); // PCMU
         assert!(frames(&mut unpacker, &with_type(8, &[0; 960])).is_empty()); // PCMA
         assert!(frames(&mut unpacker, &with_type(rtp::L16, &[0; 961])).is_empty()); // a broken frame
+    }
+
+    #[test]
+    fn delays_in_the_device_list() {
+        assert_eq!(super::split_delay("Bose+180ms"), Ok(("Bose", 180)));
+        assert_eq!(super::split_delay(" HDMI 2 + 80 ms"), Ok((" HDMI 2", 80)));
+        assert_eq!(super::split_delay("HDMI 2"), Ok(("HDMI 2", 0)));
+        assert_eq!(super::split_delay("Speakers + Mic"), Ok(("Speakers + Mic", 0))); // a name with a plus
+        assert!(super::split_delay("Bose+5000ms").is_err());
     }
 
     #[test]
