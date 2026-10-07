@@ -6,6 +6,7 @@
 *.zip
 *.sha256
 /rtp-audio-*/
+# Leftovers of the GUI before it moved to src/gui (build cache, screenshots).
 /GUI/
 
 # Maintainer-only notes, kept offline.
@@ -14,3 +15,10 @@
 
 # Local audit reports and the fixes log: not part of the repository.
 /progress/
+
+# The window's page: npm installs and builds these (src/gui/README.md), Tauri generates gen/.
+/src/gui/web/node_modules/
+/src/gui/web/dist/
+/src/gui/web/test-results/
+/src/gui/web/*.png
+/src/gui/gen/

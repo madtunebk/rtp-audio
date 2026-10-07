@@ -2,6 +2,7 @@
 
 mod jitter;
 mod outputs;
+mod spectrum;
 mod status;
 mod udp;
 mod websocket;
@@ -43,11 +44,15 @@ pub struct Options {
     pub json: bool,
 }
 
-/// The jitter buffers of all the outputs: every frame goes into each.
-struct Buffers(Vec<(String, Arc<Mutex<Jitter>>)>);
+/// The jitter buffers of all the outputs: every frame goes into each (and into the spectrum, with
+/// --json).
+struct Buffers(Vec<(String, Arc<Mutex<Jitter>>)>, Option<Mutex<spectrum::Spectrum>>);
 
 impl Buffers {
     fn push(&self, sequence: u16, pcm: &[u8], channels: usize) {
+        if let Some(spectrum) = &self.1 {
+            spectrum.lock().unwrap().feed(pcm, channels);
+        }
         for (_, jitter) in &self.0 {
             jitter.lock().unwrap().push(sequence, pcm, channels);
         }
@@ -133,7 +138,7 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
         [(_, details)] => format!("sound card: {details}"),
         _ => format!("playing on {} outputs: {}", cards.len(), cards.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", ")),
     };
-    let jitter = Buffers(buffers);
+    let jitter = Buffers(buffers, options.json.then(|| Mutex::new(spectrum::Spectrum::new(options.rate))));
     let mut monitor = Monitor::new(options.rate, options.json.then_some(ids));
     match &options.url {
         Some(url) => receive_websocket(url, &options, &card, &jitter, &peak, &mut monitor),

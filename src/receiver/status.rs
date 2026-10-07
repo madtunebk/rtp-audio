@@ -19,6 +19,7 @@ pub(super) struct Monitor {
     last_status: Instant,
     /// Per output, the totals the status line and the reports last counted from.
     shown: Vec<Stats>,
+    last_spectrum: Instant,
     last_report: Instant,
     reported: Vec<Stats>,
     last_packet: Instant,
@@ -37,6 +38,7 @@ impl Monitor {
             packets: 0,
             last_status: now,
             shown: Vec::new(),
+            last_spectrum: now,
             last_report: now,
             reported: Vec::new(),
             last_packet: now,
@@ -69,6 +71,15 @@ impl Monitor {
         self.reported.resize(stats.len(), Stats::default());
         let labels = jitter.labels();
         if let Some(ids) = &self.json {
+            // While sound arrives, its spectrum 20 times a second: {"spectrum":[0.12,…]}.
+            if let Some(spectrum) = &jitter.1
+                && self.last_spectrum.elapsed() >= SPECTRUM_EVERY
+                && self.last_packet.elapsed() < SPECTRUM_EVERY
+            {
+                let bands = spectrum.lock().unwrap().bands();
+                println!("{{\"spectrum\":[{}]}}", bands.iter().map(|b| format!("{b:.2}")).collect::<Vec<_>>().join(","));
+                self.last_spectrum = Instant::now();
+            }
             if self.last_status.elapsed() >= JSON_EVERY {
                 let seconds = self.last_status.elapsed().as_secs_f32();
                 let level = f32::from_bits(peak.swap(0, Ordering::Relaxed));
@@ -111,8 +122,9 @@ impl Monitor {
 
 pub(super) const STATUS_EVERY: Duration = Duration::from_millis(250);
 
-/// How often --json prints the status.
+/// How often --json prints the status, and the spectrum.
 const JSON_EVERY: Duration = Duration::from_millis(500);
+const SPECTRUM_EVERY: Duration = Duration::from_millis(50);
 
 /// The status for a program: who sends, packets per second, the emptiest buffer, the level (dB,
 /// null when silent), the network problems and each output's playing problems (by its ID from

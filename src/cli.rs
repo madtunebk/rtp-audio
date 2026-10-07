@@ -48,6 +48,8 @@ usage:
   rtp-audio service uninstall | status | start | stop | restart
   rtp-audio version
       print the version (also --version)
+  rtp-audio gui
+      open the window (also --gui), when rtp-audio was built with it
   rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]
       send raw big-endian 16-bit PCM read from stdin
 
@@ -55,6 +57,8 @@ HOST is the receiving computer, e.g. rtp-audio send 192.168.1.20:46000";
 
 pub enum Command {
     Help,
+    /// Open the window.
+    Gui,
     Version,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Service { action: String, send_args: Vec<String> },
@@ -89,6 +93,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
     match args.first().map(String::as_str) {
         Some("service") => return parse_service(args),
         Some("version") => return Ok(Command::Version),
+        Some("gui" | "--gui") if args.len() == 1 => return Ok(Command::Gui),
         _ => {}
     }
     let mut command: Option<String> = None;

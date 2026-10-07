@@ -12,6 +12,11 @@ if-addrs = "0.15"
 opus = "0.4"
 socket2 = "0.6"
 tungstenite = "0.30"
+# The window (`rtp-audio --gui`), built with `--features gui` after `npm run build` in src/gui/web.
+rtp-audio-studio = { path = "src/gui", optional = true, features = ["custom-protocol"] }
+
+[features]
+gui = ["dep:rtp-audio-studio"]
 
 [profile.release]
 strip = true

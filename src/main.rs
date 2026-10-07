@@ -35,6 +35,14 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             println!("rtp-audio {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        #[cfg(feature = "gui")]
+        Command::Gui => {
+            // The window runs this very program for its commands: always the same version.
+            rtp_audio_studio::run(std::env::current_exe().ok());
+            Ok(())
+        }
+        #[cfg(not(feature = "gui"))]
+        Command::Gui => Err("this rtp-audio was built without the window (cargo build --release --features gui)".into()),
         Command::Receive(options) => receiver::run(options),
         Command::Devices { json } => receiver::list_devices(json),
         Command::Keygen => {
