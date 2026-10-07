@@ -220,6 +220,8 @@ fn outputs() -> Result<Vec<Outlet>, Box<dyn Error>> {
     let mut seen = std::collections::HashSet::new();
     Ok(all
         .into_iter()
+        // ALSA plugins that only convert, mix channels or lead to other systems: not outputs.
+        .filter(|o| !ALSA_HELPERS.iter().any(|helper| o.id == format!("alsa:{helper}")))
         .filter(|o| match alsa_port(&o.id) {
             // A card's port once: hw:CARD=NVidia,DEV=3 and hw:CARD=1,DEV=3 are the same one.
             Some(port) => {
@@ -230,6 +232,10 @@ fn outputs() -> Result<Vec<Outlet>, Box<dyn Error>> {
         })
         .collect())
 }
+
+/// ALSA plugins listed as outputs that aren't places to play: rate converters, channel
+/// up/down-mixers, effects, and bridges to JACK and OSS.
+const ALSA_HELPERS: &[&str] = &["lavrate", "samplerate", "speexrate", "speex", "upmix", "vdownmix", "jack", "oss"];
 
 /// An ALSA card port, from an ID like alsa:hw:CARD=NVidia,DEV=3.
 struct AlsaPort {
