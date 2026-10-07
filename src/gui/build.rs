@@ -13,7 +13,11 @@ fn main() {
         run(Command::new(npm).arg("ci").current_dir(web));
     }
     run(Command::new(npm).args(["run", "build"]).current_dir(web));
-    tauri_build::build();
+    // The C runtime is linked like in every Rust program (vcruntime140.dll), not statically: on MSVC
+    // tauri-build's static runtime puts an empty msvcrt.lib on the library path, which rtp-audio.exe
+    // links against too without the linker arguments that go with it, and then fails to link.
+    let windows = tauri_build::WindowsAttributes::new().static_vc_runtime(false);
+    tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(windows)).expect("tauri-build");
 }
 
 fn run(command: &mut Command) {
