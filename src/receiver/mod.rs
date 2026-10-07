@@ -149,7 +149,7 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     }
     let mut jitter = Buffers(buffers, options.json.then(|| spectrum::Tap::new(options.rate)));
     if options.sync && cards.len() > 1 {
-        println!("Lining the outputs up by the latency each reports (--sync); a Bluetooth speaker's own delay may not be reported: add it with +NNms");
+        println!("Lining the outputs up by the latency each reports (--sync); on Windows a Bluetooth speaker's own delay isn't reported: add it with +NNms");
     }
     let mut monitor = Monitor::new(options.rate, options.json.then_some(ids), options.sync);
     match &options.url {

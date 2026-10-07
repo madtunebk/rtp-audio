@@ -14,8 +14,8 @@ usage:
       --device an output from `rtp-audio devices` (several, separated by commas, play the same
       sound at once: --device 'HDMI, Headphones'; each can end with a delay and a volume of its
       own: 'HDMI+80ms, Bose@50%'), --volume in percent, --group also listens to a multicast
-      group, --sync lines several outputs up by the latency each reports (a Bluetooth
-      speaker's own delay may not be: add that with +NNms), --json prints the status as a
+      group, --sync lines several outputs up by the latency each reports (on Windows not a
+      Bluetooth speaker's own delay: add that with +NNms), --json prints the status as a
       JSON line every half second (for programs)
   rtp-audio [receive] ws://HOST:PORT [--latency 60] [--device NAME[,NAME...]] [--volume 100] [--sync] [--json]
       play the stream of `rtp-audio send --web` over TCP instead: nothing is lost, and it goes

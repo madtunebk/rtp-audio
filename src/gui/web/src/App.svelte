@@ -188,6 +188,14 @@
     const s = status?.outputs?.find(o => o.id === output.id);
     return s ? s.dropouts + s.skips + s.card : 0;
   }
+  /** Hovering an output while it plays: what kind of problems, and its timing. */
+  function details(output, status, running) {
+    const s = running && status?.outputs?.find(o => o.id === output.id);
+    const base = `${output.detail} · ${output.id}`;
+    if (!s) return base;
+    return `${base}\n${s.dropouts} dropouts (sound ran out: bigger buffer) · ${s.skips} skips (burst, trimmed) · ${s.card} card underruns\n` +
+      `buffer ${s.buffer_ms} ms · device latency ${s.device_ms} ms${s.sync_ms ? ` · sync +${s.sync_ms} ms` : ''}`;
+  }
   function level(output, index, bar, active, phase, status) {
     if (!active || !output.enabled || output.gain <= 0) return false;
     if (!real) return bar < (16 + Math.sin(phase * 0.13 + index * 0.9) * 9) * output.gain / 100;
@@ -273,7 +281,7 @@
           {#each visibleOutputs as {output,index} (output.id)}
             <div class="output-row" class:disabled={!output.enabled} role="row">
               <label class="switch"><input aria-label={`Enable ${output.name}`} type="checkbox" bind:checked={outputs[index].enabled} disabled={running}/><span></span></label>
-              <div class="output-name" title={`${output.detail} · ${output.id}`}><strong>{output.name}</strong><small>{output.detail}{#if running && problems(output, status)} · <span class="problems">{problems(output, status)} problems</span>{/if}</small></div>
+              <div class="output-name" title={details(output, status, running)}><strong>{output.name}</strong><small>{output.detail}{#if running && problems(output, status)} · <span class="problems">{problems(output, status)} problems</span>{/if}</small></div>
               <div class="meter" aria-label={`Simulated level for ${output.name}`}>{#each bars as bar}<span class:lit={level(output,index,bar,running,tick,status)} class:peak={bar>27}></span>{/each}</div>
               <label class="row-gain"><input aria-label={`${output.name} gain`} type="range" min="0" max="200" step="5" bind:value={outputs[index].gain} disabled={!output.enabled || running}/><span>{output.gain}%</span></label>
               <label class="row-delay"><input id={`delay-${index}`} aria-label={`${output.name} delay`} type="number" min="0" max="2000" bind:value={outputs[index].delay} disabled={!output.enabled || running}/><span>ms</span></label>
