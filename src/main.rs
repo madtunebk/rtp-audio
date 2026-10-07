@@ -2,6 +2,7 @@
 //! and on Linux, send this machine's sound. See `cli::USAGE`.
 
 mod cli;
+mod json;
 mod net;
 mod receiver;
 // The sender (and its web server) captures through PulseAudio/PipeWire: Linux only.
@@ -35,7 +36,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Command::Receive(options) => receiver::run(options),
-        Command::Devices => receiver::list_devices(),
+        Command::Devices { json } => receiver::list_devices(json),
         Command::Keygen => {
             println!("{}", net::secure::generate()?);
             // Only when the key went to the screen: `keygen > file` needs no advice.
@@ -56,7 +57,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             net::transport::send_stdin(options.destinations[0], options.rate, options.channels, options.encoding)
         }
         #[cfg(target_os = "linux")]
-        Command::Sources => sender::list_sources(),
+        Command::Sources { json } => sender::list_sources(json),
         #[cfg(target_os = "linux")]
         Command::Service { action, send_args } => sender::service::run(&action, &send_args),
         #[cfg(target_os = "linux")]
@@ -67,7 +68,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             sender::send::run(&options.destinations, options.encoding, options.source.as_deref(), options.web, options.mic)
         }
         #[cfg(not(target_os = "linux"))]
-        Command::Sources | Command::Send(_) | Command::Service { .. } => {
+        Command::Sources { .. } | Command::Send(_) | Command::Service { .. } => {
             Err("capturing sound is only supported on Linux; here, pipe raw audio into `send HOST:PORT --stdin`".into())
         }
     }

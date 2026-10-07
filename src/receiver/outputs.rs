@@ -90,10 +90,25 @@ pub(super) fn alsa_port(id: &str) -> Option<AlsaPort> {
     Some(AlsaPort { plugin: plugin.to_string(), card, dev: field("DEV=").unwrap_or_default() })
 }
 
-/// `rtp-audio devices`: the sound outputs this computer can play on.
-pub fn list_devices() -> Result<(), Box<dyn Error>> {
+/// `rtp-audio devices`: the sound outputs this computer can play on. With --json, for programs:
+/// [{"name":"HDA NVidia, 2590G5","id":"alsa:hw:CARD=NVidia,DEV=3","default":false,"direct":true}]
+/// where direct is a card opened directly (not through the sound server).
+pub fn list_devices(json: bool) -> Result<(), Box<dyn Error>> {
     let default = cpal::default_host().default_output_device().map(|d| device_id(&d));
     let outputs = outputs()?;
+    if json {
+        use crate::json::string;
+        let items: Vec<String> = outputs
+            .iter()
+            .map(|o| {
+                let direct = alsa_port(&o.id).is_some_and(|port| port.plugin == "hw");
+                let default = Some(&o.id) == default.as_ref();
+                format!(r#"{{"name":{},"id":{},"default":{default},"direct":{direct}}}"#, string(&o.name), string(&o.id))
+            })
+            .collect();
+        println!("[{}]", items.join(","));
+        return Ok(());
+    }
     let width = outputs.iter().map(|o| o.name.chars().count()).max().unwrap_or(0);
     println!("Sound outputs (play on one with: rtp-audio --device NAME_OR_ID):");
     let direct = |o: &Outlet| alsa_port(&o.id).is_some_and(|port| port.plugin == "hw");
@@ -162,9 +177,9 @@ pub(super) fn pick_device(wanted: Option<&str>) -> Result<cpal::Device, Box<dyn 
 /// can contain commas themselves ("HD-Audio Generic, ALC897 Analog", alsa:hw:CARD=Generic,DEV=0),
 /// so the list is read left to right, taking each time the longest run of comma-separated parts
 /// that is exactly an output's name or ID, else one part as (part of) a name.
-pub(super) fn pick_devices(wanted: &[String]) -> Result<Vec<(cpal::Device, u32)>, Box<dyn Error>> {
+pub(super) fn pick_devices(wanted: &[String]) -> Result<Vec<(cpal::Device, Tuning)>, Box<dyn Error>> {
     if wanted.is_empty() {
-        return Ok(vec![(pick_device(None)?, 0)]);
+        return Ok(vec![(pick_device(None)?, Tuning::default())]);
     }
     let outputs = outputs()?;
     // An exact ID, or a name only one output has (a shared name is left to pick_device, which
@@ -185,9 +200,9 @@ pub(super) fn pick_devices(wanted: &[String]) -> Result<Vec<(cpal::Device, u32)>
         if outputs.iter().filter(|o| o.name.eq_ignore_ascii_case(value.trim())).count() > 1 {
             pick_device(Some(value.trim()))?;
         }
-        // Each part may end with a delay for its output ("Bose+180ms"); the delay of an output whose
-        // name spans several parts is the last part's.
-        let parts: Vec<(&str, u32)> = value.split(',').map(split_delay).collect::<Result<_, _>>()?;
+        // Each part may end with a delay and a volume for its output ("Bose+180ms@50%"); those of an
+        // output whose name spans several parts are the last part's.
+        let parts: Vec<(&str, Tuning)> = value.split(',').map(split_tuning).collect::<Result<_, _>>()?;
         let mut i = 0;
         while i < parts.len() {
             let joined = |j: usize| parts[i..j].iter().map(|(text, _)| *text).collect::<Vec<_>>().join(",");
@@ -198,9 +213,9 @@ pub(super) fn pick_devices(wanted: &[String]) -> Result<Vec<(cpal::Device, u32)>
                     i = j;
                 }
                 None => {
-                    let (part, delay) = (parts[i].0.trim(), parts[i].1);
+                    let (part, tuning) = (parts[i].0.trim(), parts[i].1);
                     if !part.is_empty() {
-                        devices.push((pick_device(Some(part))?, delay));
+                        devices.push((pick_device(Some(part))?, tuning));
                     }
                     i += 1;
                 }
@@ -219,21 +234,53 @@ pub(super) fn pick_devices(wanted: &[String]) -> Result<Vec<(cpal::Device, u32)>
 /// The longest delay an output can be given, to line it up with slower ones.
 pub(super) const MAX_DELAY_MS: u32 = 2_000;
 
-/// One part of the --device list and its delay: "Bose+180ms" → ("Bose", 180), "HDMI" → ("HDMI", 0).
-pub(super) fn split_delay(part: &str) -> Result<(&str, u32), String> {
-    let trimmed = part.trim_end();
-    if let Some(number) = trimmed.strip_suffix("ms")
-        && let Some((name, ms)) = number.rsplit_once('+')
-        && !ms.trim().is_empty()
-        && ms.trim().chars().all(|c| c.is_ascii_digit())
-    {
-        let ms: u32 = ms.trim().parse().map_err(|_| format!("bad delay in '{part}'"))?;
-        if ms > MAX_DELAY_MS {
-            return Err(format!("the delay in '{}' must be at most {MAX_DELAY_MS} ms", part.trim()));
-        }
-        return Ok((name.trim_end(), ms));
+/// What one output in the --device list asks for besides its name: a delay and a volume.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Tuning {
+    pub(super) delay_ms: u32,
+    /// Times the --volume: 1.0 is unchanged.
+    pub(super) volume: f32,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning { delay_ms: 0, volume: 1.0 }
     }
-    Ok((part, 0))
+}
+
+/// The loudest an output can be made on its own, in percent (like --volume).
+pub(super) const MAX_OUTPUT_VOLUME: f32 = 400.0;
+
+/// One part of the --device list and what it asks for, at its end in either order: a delay
+/// ("Bose+180ms") and a volume ("Bose@50%"). "Bose+180ms@50%" → ("Bose", 180 ms, 0.5).
+pub(super) fn split_tuning(part: &str) -> Result<(&str, Tuning), String> {
+    let mut tuning = Tuning::default();
+    let (mut name, mut delay, mut volume) = (part, false, false);
+    loop {
+        let trimmed = name.trim_end();
+        if !delay && let Some((rest, ms)) = suffix(trimmed, "ms", '+') {
+            let ms: u32 = ms.parse().map_err(|_| format!("bad delay in '{}'", part.trim()))?;
+            if ms > MAX_DELAY_MS {
+                return Err(format!("the delay in '{}' must be at most {MAX_DELAY_MS} ms", part.trim()));
+            }
+            (tuning.delay_ms, name, delay) = (ms, rest, true);
+        } else if !volume && let Some((rest, percent)) = suffix(trimmed, "%", '@') {
+            let percent: f32 = percent.parse().map_err(|_| format!("bad volume in '{}'", part.trim()))?;
+            if percent > MAX_OUTPUT_VOLUME {
+                return Err(format!("the volume in '{}' must be at most {MAX_OUTPUT_VOLUME}%", part.trim()));
+            }
+            (tuning.volume, name, volume) = (percent / 100.0, rest, true);
+        } else {
+            return Ok((if delay || volume { trimmed } else { part }, tuning));
+        }
+    }
+}
+
+/// "NAME + 80 ms" with unit "ms" and mark '+' → ("NAME", "80"): a whole number after the mark.
+fn suffix<'a>(text: &'a str, unit: &str, mark: char) -> Option<(&'a str, &'a str)> {
+    let (rest, number) = text.strip_suffix(unit)?.rsplit_once(mark)?;
+    let number = number.trim();
+    (!number.is_empty() && number.chars().all(|c| c.is_ascii_digit())).then(|| (rest.trim_end(), number))
 }
 
 /// How much a card opened directly (ALSA hw:) is asked for at a time: 20 ms. Left to itself,
@@ -376,12 +423,19 @@ where
 #[cfg(test)]
 mod tests {
     #[test]
-    fn delays_in_the_device_list() {
-        assert_eq!(super::split_delay("Bose+180ms"), Ok(("Bose", 180)));
-        assert_eq!(super::split_delay(" HDMI 2 + 80 ms"), Ok((" HDMI 2", 80)));
-        assert_eq!(super::split_delay("HDMI 2"), Ok(("HDMI 2", 0)));
-        assert_eq!(super::split_delay("Speakers + Mic"), Ok(("Speakers + Mic", 0))); // a name with a plus
-        assert!(super::split_delay("Bose+5000ms").is_err());
+    fn delays_and_volumes_in_the_device_list() {
+        use super::{Tuning, split_tuning};
+        let tuned = |delay_ms, volume| Tuning { delay_ms, volume };
+        assert_eq!(split_tuning("Bose+180ms"), Ok(("Bose", tuned(180, 1.0))));
+        assert_eq!(split_tuning(" HDMI 2 + 80 ms"), Ok((" HDMI 2", tuned(80, 1.0))));
+        assert_eq!(split_tuning("HDMI 2"), Ok(("HDMI 2", Tuning::default())));
+        assert_eq!(split_tuning("Speakers + Mic"), Ok(("Speakers + Mic", Tuning::default()))); // a name with a plus
+        assert!(split_tuning("Bose+5000ms").is_err());
+        assert_eq!(split_tuning("Bose@50%"), Ok(("Bose", tuned(0, 0.5))));
+        assert_eq!(split_tuning("Bose+180ms@50%"), Ok(("Bose", tuned(180, 0.5))));
+        assert_eq!(split_tuning("Bose @ 50 % + 180 ms"), Ok(("Bose", tuned(180, 0.5))));
+        assert_eq!(split_tuning("Speakers @ home"), Ok(("Speakers @ home", Tuning::default())));
+        assert!(split_tuning("Bose@500%").is_err());
     }
 
     #[test]

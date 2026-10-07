@@ -39,6 +39,8 @@ pub struct Options {
     pub discovery: bool,
     /// Play the sender's WebSocket stream (ws://…) instead of listening for UDP.
     pub url: Option<String>,
+    /// The status as JSON lines, for a program running the receiver.
+    pub json: bool,
 }
 
 /// The jitter buffers of all the outputs: every frame goes into each.
@@ -94,20 +96,25 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     // Loudest sample played since the status line last looked, as f32 bits.
     let peak = Arc::new(AtomicU32::new(0));
     // One buffer per output: each sound card runs on its own clock, so each keeps its own level.
-    let (mut buffers, mut streams, mut cards) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut buffers, mut streams, mut cards, mut ids) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let devices = pick_devices(&options.devices)?;
     let several = devices.len() > 1;
     let mut first_error = None;
-    for (device, delay_ms) in devices {
+    for (device, tuning) in devices {
         // A delayed output keeps that much more sound buffered, so it plays that much later.
-        let delayed = target + (u64::from(options.rate) * u64::from(delay_ms) / 1000) as usize;
+        let delayed = target + (u64::from(options.rate) * u64::from(tuning.delay_ms) / 1000) as usize;
         let jitter = Arc::new(Mutex::new(Jitter::new(delayed)));
-        let out = Output { jitter: Arc::clone(&jitter), peak: Arc::clone(&peak), volume: options.volume, input_rate: options.rate };
+        let volume = options.volume * tuning.volume;
+        let out = Output { jitter: Arc::clone(&jitter), peak: Arc::clone(&peak), volume, input_rate: options.rate };
         match open_output(&device, out) {
             Ok((stream, card)) => {
-                let delay = if delay_ms > 0 { format!(" +{delay_ms} ms") } else { String::new() };
+                let mut delay = if tuning.delay_ms > 0 { format!(" +{} ms", tuning.delay_ms) } else { String::new() };
+                if tuning.volume != 1.0 {
+                    delay += &format!(" {:.0}%", tuning.volume * 100.0);
+                }
                 cards.push((format!("{}{delay}", device_name(&device)), format!("{card}{delay}")));
                 buffers.push((short_name(&device_name(&device)), jitter));
+                ids.push(outputs::device_id(&device));
                 streams.push(stream);
             }
             // With several outputs, one that won't open is skipped: the others still play.
@@ -127,7 +134,7 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
         _ => format!("playing on {} outputs: {}", cards.len(), cards.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", ")),
     };
     let jitter = Buffers(buffers);
-    let mut monitor = Monitor::new(options.rate);
+    let mut monitor = Monitor::new(options.rate, options.json.then_some(ids));
     match &options.url {
         Some(url) => receive_websocket(url, &options, &card, &jitter, &peak, &mut monitor),
         None => receive_udp(&options, &card, &jitter, &peak, &mut monitor),

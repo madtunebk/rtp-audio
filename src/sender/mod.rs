@@ -22,9 +22,19 @@ pub enum Event {
 }
 
 /// `rtp-audio sources`: works while a sender is running, as it takes no lock.
-pub fn list_sources() -> Result<(), Box<dyn Error>> {
+pub fn list_sources(json: bool) -> Result<(), Box<dyn Error>> {
     let pulse = pulse::Pulse::connect()?;
     let sources = pulse.sources()?;
+    // For programs: [{"id":42,"name":"alsa_output….monitor","description":"Monitor of …"}]
+    if json {
+        use crate::json::string;
+        let items: Vec<String> = sources
+            .iter()
+            .map(|s| format!(r#"{{"id":{},"name":{},"description":{}}}"#, s.index, string(&s.name), string(&s.description)))
+            .collect();
+        println!("[{}]", items.join(","));
+        return Ok(());
+    }
     let width = sources.iter().map(|source| source.name.len()).max().unwrap_or(0).max(4);
     println!("{:>4}  {:width$}  DESCRIPTION", "ID", "NAME");
     for source in &sources {

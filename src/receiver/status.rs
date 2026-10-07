@@ -10,6 +10,9 @@ use super::jitter::Stats;
 /// The live status line at a terminal, or occasional reports in a log, for either source.
 pub(super) struct Monitor {
     pub(super) live: bool,
+    /// A JSON status line every JSON_EVERY instead of the status line or the reports, naming the
+    /// outputs by these IDs.
+    json: Option<Vec<String>>,
     rate: u32,
     sender: Option<String>,
     packets: u32,
@@ -23,11 +26,12 @@ pub(super) struct Monitor {
 }
 
 impl Monitor {
-    pub(super) fn new(rate: u32) -> Self {
+    pub(super) fn new(rate: u32, json: Option<Vec<String>>) -> Self {
         let now = Instant::now();
         Monitor {
             // At a terminal, one status line updates in place; in a log, only events and problems.
-            live: std::io::stdout().is_terminal(),
+            live: json.is_none() && std::io::stdout().is_terminal(),
+            json,
             rate,
             sender: None,
             packets: 0,
@@ -64,7 +68,16 @@ impl Monitor {
         self.shown.resize(stats.len(), Stats::default());
         self.reported.resize(stats.len(), Stats::default());
         let labels = jitter.labels();
-        if self.live && self.last_status.elapsed() >= STATUS_EVERY {
+        if let Some(ids) = &self.json {
+            if self.last_status.elapsed() >= JSON_EVERY {
+                let seconds = self.last_status.elapsed().as_secs_f32();
+                let level = f32::from_bits(peak.swap(0, Ordering::Relaxed));
+                let waiting = self.last_packet.elapsed() > Duration::from_secs(1);
+                let rate = self.packets as f32 / seconds;
+                println!("{}", json_status(self.sender.as_deref(), waiting, rate, buffered * 1000 / self.rate as usize, &labels, ids, &stats, level));
+                (self.last_status, self.packets) = (Instant::now(), 0);
+            }
+        } else if self.live && self.last_status.elapsed() >= STATUS_EVERY {
             let seconds = self.last_status.elapsed().as_secs_f32();
             let level = f32::from_bits(peak.swap(0, Ordering::Relaxed));
             let waiting = self.last_packet.elapsed() > Duration::from_secs(1);
@@ -97,6 +110,34 @@ impl Monitor {
 }
 
 pub(super) const STATUS_EVERY: Duration = Duration::from_millis(250);
+
+/// How often --json prints the status.
+const JSON_EVERY: Duration = Duration::from_millis(500);
+
+/// The status for a program: who sends, packets per second, the emptiest buffer, the level (dB,
+/// null when silent), the network problems and each output's playing problems (by its ID from
+/// `devices --json`), as totals since the start, on one line:
+/// {"status":{"sender":"192.168.1.5:40000","waiting":false,"packets":50,"buffer_ms":60,"level_db":-12.3,
+///  "lost":0,"late":0,"outputs":[{"name":"HDMI 2","id":"alsa:hw:…","dropouts":0,"skips":0,"card":0}]}}
+#[allow(clippy::too_many_arguments)]
+fn json_status(sender: Option<&str>, waiting: bool, rate: f32, buffer_ms: usize, labels: &[&str], ids: &[String], stats: &[Stats], level: f32) -> String {
+    use crate::json::string;
+    let sender = sender.map_or("null".to_string(), string);
+    let level = if level > 1e-4 { format!("{:.1}", 20.0 * level.log10()) } else { "null".to_string() };
+    let (lost, late) = stats.first().map_or((0, 0), |s| (s.lost, s.late));
+    let outputs: Vec<String> = labels
+        .iter()
+        .zip(ids)
+        .zip(stats)
+        .map(|((name, id), s)| {
+            format!(r#"{{"name":{},"id":{},"dropouts":{},"skips":{},"card":{}}}"#, string(name), string(id), s.underruns, s.trimmed, s.card)
+        })
+        .collect();
+    format!(
+        r#"{{"status":{{"sender":{sender},"waiting":{waiting},"packets":{rate:.0},"buffer_ms":{buffer_ms},"level_db":{level},"lost":{lost},"late":{late},"outputs":[{}]}}}}"#,
+        outputs.join(",")
+    )
+}
 
 pub(super) const STATUS_WIDTH: usize = 100;
 
