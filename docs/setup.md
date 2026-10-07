@@ -95,6 +95,9 @@ rtp-audio --key-file rtp-audio.key                                       # recei
 
 - `--opus` compresses the sound to about 150 kbit/s with no audible difference: fine over Wi-Fi,
   a VPN or a phone hotspot. A lost packet is filled in by Opus instead of becoming silence.
+  `--bitrate KBPS` (16–510, default 128) sets how much: 64 still sounds fine on a slow link (a
+  tired VPS, 4G), 256 is close to lossless. It also applies to `--web`; the receiver and the
+  browser need nothing.
 - `--key-file` (or `--key KEY`) encrypts and authenticates every packet with ChaCha20-Poly1305.
   Nobody without the key can listen, change the sound or replay it. A receiver with a key
   ignores anything not encrypted with it, and tells you why if the keys don't match.
@@ -181,7 +184,7 @@ rtp-audio find [--port 46000]                                     # receivers on
 rtp-audio devices                                                 # outputs for --device
 rtp-audio keygen                                                  # a key for --key / --key-file
 rtp-audio sources
-rtp-audio send HOST:PORT [HOST:PORT…] [--source NAME_OR_ID] [--opus] [--key-file FILE]   # or `auto`
+rtp-audio send HOST:PORT [HOST:PORT…] [--source NAME_OR_ID] [--opus [--bitrate 128]] [--key-file FILE]   # or `auto`
 rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]   # raw s16be PCM from stdin
 rtp-audio send --web 46080 [--mic] [HOST:PORT]                   # sound (and microphone) in the browser, see web.md
 rtp-audio service install SEND_OPTIONS | uninstall | status | start | stop | restart

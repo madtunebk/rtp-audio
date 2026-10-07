@@ -4,7 +4,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::receiver;
 use crate::net::secure::Key;
-use crate::net::transport::Encoding;
+use crate::net::transport::{Encoding, OPUS_KBPS_RANGE};
 
 pub const USAGE: &str = "\
 usage:
@@ -35,8 +35,9 @@ usage:
       receiver `rtp-audio find` sees
   rtp-audio send HOST:PORT --source NAME_OR_ID
       send one source from `rtp-audio sources` instead, without changing any output
-  rtp-audio send HOST:PORT [--opus] [--key KEY | --key-file FILE]
-      --opus: about 128 kbit/s instead of 1.5 Mbit/s (needs an rtp-audio receiver);
+  rtp-audio send HOST:PORT [--opus [--bitrate 128]] [--key KEY | --key-file FILE]
+      --opus: about 128 kbit/s instead of 1.5 Mbit/s (needs an rtp-audio receiver), --bitrate
+      sets it (16–510 kbit/s, also for --web: 64 for a slow link, 256 near lossless);
       --key/--key-file: encrypt (the receiver needs the same key)
   rtp-audio send --web 127.0.0.1:46080 [--mic] [HOST:PORT] [--source NAME_OR_ID]
       (also) serve the sound to web browsers as Opus over a WebSocket, with a noVNC player;
@@ -101,7 +102,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
     let (mut port, mut latency_ms, mut rate, mut channels) = (None, None, None, None);
     let (mut source, mut stdin, mut web) = (None, false, None);
     let (mut devices, mut volume): (Vec<String>, _) = (Vec::new(), None);
-    let (mut opus, mut key, mut key_file, mut mic) = (false, None, None, false);
+    let (mut opus, mut key, mut key_file, mut mic, mut kbps) = (false, None, None, false, None);
     let (mut group, mut discovery, mut json) = (None, true, false);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -122,6 +123,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }
             "--device" => devices.push(value()?),
             "--opus" => opus = true,
+            "--bitrate" => kbps = Some(number::<u32>(&arg, &value()?)?),
             "--mic" => mic = true,
             "--group" => group = Some(value()?),
             "--no-discovery" => discovery = false,
@@ -149,6 +151,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             ("--device", !devices.is_empty()),
             ("--volume", volume.is_some()),
             ("--opus", opus),
+            ("--bitrate", kbps.is_some()),
             ("--key", key.is_some()),
             ("--key-file", key_file.is_some()),
             ("--mic", mic),
@@ -210,12 +213,12 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 ));
             }
             if stdin {
-                only(&["--stdin", "--rate", "--channels", "--opus", "--key", "--key-file"])?;
+                only(&["--stdin", "--rate", "--channels", "--opus", "--bitrate", "--key", "--key-file"])?;
                 if destinations.len() + usize::from(auto.is_some()) != 1 {
                     return Err("--stdin sends to exactly one receiver".into());
                 }
             } else {
-                only(&["--source", "--web", "--opus", "--key", "--key-file", "--mic"])?;
+                only(&["--source", "--web", "--opus", "--bitrate", "--key", "--key-file", "--mic"])?;
                 if mic && web.is_none() {
                     return Err("--mic takes the microphone from browsers: it needs --web".into());
                 }
@@ -225,13 +228,20 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                     already Opus, and NGINX's HTTPS protects it"
                     .into());
             }
+            if let Some(kbps) = kbps {
+                // PCM has one rate; browsers always get Opus.
+                if !opus && web.is_none() {
+                    return Err("--bitrate is Opus's bit rate: add --opus (or use --web)".into());
+                }
+                within("--bitrate", kbps, OPUS_KBPS_RANGE, "kbit/s")?;
+            }
             if source.as_deref().is_some_and(|s| s.trim().is_empty()) {
                 return Err("--source needs a source name or ID (see rtp-audio sources)".into());
             }
             Ok(Command::Send(SendOptions {
                 destinations,
                 auto,
-                encoding: Encoding { opus, key: read_key(key, key_file)? },
+                encoding: Encoding { opus, key: read_key(key, key_file)?, kbps },
                 web: web.as_deref().map(parse_web).transpose()?,
                 mic,
                 source,
@@ -418,6 +428,11 @@ mod tests {
         let key = crate::net::secure::generate().unwrap();
         let Ok(Command::Send(send)) = parse(args(&format!("send 10.0.0.2:46000 --opus --key {key}"))) else { panic!() };
         assert!(send.encoding.opus && send.encoding.key.is_some());
+        assert!(matches!(parse(args("send 10.0.0.2:46000 --opus --bitrate 64")), Ok(Command::Send(s)) if s.encoding.kbps == Some(64)));
+        assert!(matches!(parse(args("send --web 46080 --bitrate 256")), Ok(Command::Send(s)) if s.encoding.kbps == Some(256)));
+        assert!(parse(args("send 10.0.0.2:46000 --bitrate 64")).is_err()); // PCM
+        assert!(parse(args("send 10.0.0.2:46000 --opus --bitrate 8")).is_err());
+        assert!(parse(args("send 10.0.0.2:46000 --opus --bitrate 600")).is_err());
         assert!(matches!(parse(args(&format!("--key {key}"))), Ok(Command::Receive(o)) if o.key.is_some()));
         assert!(matches!(parse(args("--device Speakers --volume 50")), Ok(Command::Receive(o)) if o.volume == 0.5 && o.devices == ["Speakers"]));
         assert!(parse(args("--device HDMI --device Headphones")).is_err());

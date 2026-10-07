@@ -50,8 +50,9 @@ pub fn run(
         sinks.push(Box::new(rtp));
     }
     if let Some(address) = web {
-        sinks.push(Box::new(web::start(address, mic.clone())?));
-        targets.push(format!("browsers (http://{address})"));
+        let kbps = encoding.kbps.unwrap_or(crate::net::transport::OPUS_KBPS);
+        sinks.push(Box::new(web::start(address, mic.clone(), kbps)?));
+        targets.push(format!("browsers (http://{address}, Opus {kbps} kbit/s)"));
         if !address.ip().is_loopback() {
             eprintln!(
                 "Warning: anyone who can reach {address} can listen, without logging in.\n  \

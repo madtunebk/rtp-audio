@@ -15,13 +15,15 @@
     { id: 'pulseaudio:bluez_output.example', name: 'Bose Flex SoundLink', detail: 'Sound server', enabled: false, gain: 70, delay: 180 },
   ];
   // The CLI's limits.
+  // The bit rates offered (the CLI takes 16–510 kbit/s).
+  const KBPS = [32, 64, 96, 128, 192, 256];
   const LIMITS = { latency: [20, 2000], volume: [0, 400], delay: [0, 2000], gain: [0, 400] };
   const clamp = (value, [low, high], fallback) => Number.isFinite(value) ? Math.min(high, Math.max(low, value)) : fallback;
 
   let outputs = real ? [] : structuredClone(demoOutputs);
   let sources = [];
   let mode = 'receive', transport = 'udp', recvPort = 46000, wsAddress = 'localhost:46080';
-  let delivery = 'udp', destination = '', webPort = 46080, opus = true, mic = false, source = '';
+  let delivery = 'udp', destination = '', webPort = 46080, opus = true, mic = false, source = '', kbps = 128;
   let latency = 60, volume = 100;
   let running = false, starting = false, elapsed = 0, tick = 0, presets = [], presetName = '', presetOpen = false;
   let logOpen = false, notice = '', copied = false, loaded = false, saved = null;
@@ -37,7 +39,9 @@
   let logs = [real ? 'Studio ready.' : 'Studio ready. Example devices loaded.'];
   const bars = Array.from({ length: 34 }, (_, i) => i);
   $: enabled = outputs.filter(o => o.enabled).length;
-  $: settings = { mode, transport, recvPort, wsAddress, delivery, destination, webPort, opus, mic, source, latency, volume };
+  $: settings = { mode, transport, recvPort, wsAddress, delivery, destination, webPort, opus, mic, source, kbps, latency, volume };
+  // Opus's bit rate matters when something is sent as Opus: the UDP stream with Opus, or browsers.
+  $: usesOpus = (delivery !== 'web' && opus) || delivery !== 'udp';
   $: args = makeArgs(settings, outputs);
   $: command = ['rtp-audio', ...args].map(quote).join(' ');
   $: canStart = mode === 'receive' ? enabled > 0 || !real : delivery === 'web' || destination.trim() !== '';
@@ -71,6 +75,7 @@
     if (typeof data.destination === 'string') destination = data.destination;
     delivery = ['udp', 'web', 'both'].includes(data.delivery) ? data.delivery : 'udp';
     opus = data.opus !== false; mic = !!data.mic;
+    kbps = KBPS.includes(data.kbps) ? data.kbps : 128;
     if (typeof data.source === 'string') source = data.source;
     latency = clamp(data.latency, LIMITS.latency, latency);
     volume = clamp(data.volume, LIMITS.volume, volume);
@@ -159,6 +164,7 @@
       if (s.delivery !== 'web' && s.destination.trim()) a.push(s.destination.trim());
       if (s.delivery !== 'web' && s.opus) a.push('--opus');
       if (s.delivery !== 'udp' && s.mic) a.push('--mic');
+      if (((s.delivery !== 'web' && s.opus) || s.delivery !== 'udp') && s.kbps !== 128) a.push('--bitrate', String(s.kbps));
       if (s.source.trim()) a.push('--source', s.source.trim());
       return a;
     }
@@ -242,7 +248,8 @@
             <label class="field"><span>Delivery</span><select bind:value={delivery} disabled={running}><option value="udp">UDP to a receiver</option><option value="web">Browsers (noVNC, ws://)</option><option value="both">Both</option></select></label>
             {#if delivery !== 'web'}<label class="field wide"><span>Receiver · HOST:PORT</span><input bind:value={destination} disabled={running} placeholder="192.168.1.20:46000"/></label>{/if}
             {#if delivery !== 'udp'}<label class="field"><span>Web port · localhost only</span><input type="number" min="1" max="65535" bind:value={webPort} disabled={running}/></label>{/if}
-            {#if delivery !== 'web'}<label class="field"><span>Codec (UDP)</span><select bind:value={opus} disabled={running}><option value={true}>Opus · ~128 kbit/s</option><option value={false}>PCM · 1.5 Mbit/s</option></select></label>{/if}
+            {#if delivery !== 'web'}<label class="field"><span>Codec (UDP)</span><select bind:value={opus} disabled={running}><option value={true}>Opus</option><option value={false}>PCM · 1.5 Mbit/s</option></select></label>{/if}
+            {#if usesOpus}<label class="field"><span>Opus bit rate</span><select bind:value={kbps} disabled={running}>{#each KBPS as k}<option value={k}>{k} kbit/s{k === 64 ? ' · slow links' : k === 128 ? ' · default' : k === 256 ? ' · near lossless' : ''}</option>{/each}</select></label>{/if}
           {/if}
         </div>
         {#if mode === 'send'}<div class="sender-extra"><label class="field"><span>Source</span>{#if sources.length}<select bind:value={source} disabled={running}><option value="">All desktop sound</option>{#each sources as s}<option value={s.name}>{s.description}</option>{/each}</select>{:else}<input bind:value={source} disabled={running} placeholder="All desktop sound"/>{/if}</label>{#if delivery !== 'udp'}<label class="mic-toggle"><input type="checkbox" bind:checked={mic} disabled={running}/> Allow browser microphone</label>{/if}</div>{/if}

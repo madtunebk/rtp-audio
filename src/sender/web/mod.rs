@@ -29,7 +29,6 @@ const FRAME_SAMPLES: usize = RATE as usize / 50 * CHANNELS;
 /// Frames queued per listener (0.5 s); beyond that a slow listener misses frames instead of
 /// slowing down everyone else.
 const QUEUE: usize = 25;
-const BITRATE: i32 = 128_000;
 /// Connections served at once (listeners, microphone and plain requests): each has a thread.
 const MAX_CONNECTIONS: usize = 32;
 /// A listener that takes longer than this to accept a frame is gone or hopelessly behind.
@@ -141,7 +140,7 @@ pub struct WebSink {
 
 /// Start serving browsers on `address`; with `mic`, also take a browser's microphone. Returns
 /// the sink to feed captured sound into.
-pub fn start(address: SocketAddr, mic: Option<Arc<MicFeed>>) -> Result<WebSink, Box<dyn std::error::Error>> {
+pub fn start(address: SocketAddr, mic: Option<Arc<MicFeed>>, kbps: u32) -> Result<WebSink, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(address).map_err(|err| format!("cannot listen on {address}: {err}"))?;
     let hub = Arc::new(Hub::default());
     let server_hub = Arc::clone(&hub);
@@ -163,8 +162,7 @@ pub fn start(address: SocketAddr, mic: Option<Arc<MicFeed>>) -> Result<WebSink, 
             });
         }
     });
-    let mut encoder = opus::Encoder::new(RATE, opus::Channels::Stereo, opus::Application::Audio)?;
-    encoder.set_bitrate(opus::Bitrate::Bits(BITRATE))?;
+    let encoder = crate::net::transport::opus_encoder(RATE, opus::Channels::Stereo, kbps)?;
     Ok(WebSink { hub, encoder, frame: Vec::with_capacity(FRAME_SAMPLES), packet: vec![0; 4000] })
 }
 

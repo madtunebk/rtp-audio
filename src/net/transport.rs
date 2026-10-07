@@ -13,7 +13,10 @@ use crate::net::secure::Key;
 const PCM_PACKET_MS: u32 = 5;
 /// Opus: 20 ms per packet, its usual frame size.
 const OPUS_PACKET_MS: u32 = 20;
-const OPUS_BITRATE: i32 = 128_000;
+/// Opus's bit rate unless --bitrate says otherwise, in kbit/s.
+pub const OPUS_KBPS: u32 = 128;
+/// The bit rates --bitrate accepts, in kbit/s: Opus goes up to 510; below 16 music falls apart.
+pub const OPUS_KBPS_RANGE: std::ops::RangeInclusive<u32> = 16..=510;
 
 /// Somewhere captured sound goes: raw big-endian 16-bit PCM, 48 kHz stereo.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -33,6 +36,8 @@ impl AudioSink for RtpSender {
 pub struct Encoding {
     pub opus: bool,
     pub key: Option<Key>,
+    /// Opus's bit rate in kbit/s; OPUS_KBPS if none.
+    pub kbps: Option<u32>,
 }
 
 pub struct RtpSender {
@@ -45,6 +50,7 @@ pub struct RtpSender {
     timestamp_step: u32,
     channels: usize,
     encoder: Option<opus::Encoder>,
+    kbps: u32,
     key: Option<Key>,
     counter: u64,
     /// PCM waiting to fill the next packet.
@@ -70,9 +76,7 @@ impl RtpSender {
                 return Err(format!("Opus needs a rate of 8000, 12000, 16000, 24000 or 48000 Hz, not {rate}").into());
             }
             let layout = if channels == 1 { opus::Channels::Mono } else { opus::Channels::Stereo };
-            let mut encoder = opus::Encoder::new(rate, layout, opus::Application::Audio)?;
-            encoder.set_bitrate(opus::Bitrate::Bits(OPUS_BITRATE))?;
-            Some(encoder)
+            Some(opus_encoder(rate, layout, encoding.kbps.unwrap_or(OPUS_KBPS))?)
         } else {
             None
         };
@@ -100,6 +104,7 @@ impl RtpSender {
             timestamp_step,
             channels,
             encoder,
+            kbps: encoding.kbps.unwrap_or(OPUS_KBPS),
             key: encoding.key,
             counter,
             pending: Vec::new(),
@@ -174,11 +179,18 @@ impl RtpSender {
     }
 
     pub fn describe(&self) -> String {
-        let codec = if self.encoder.is_some() { "Opus" } else { "L16" };
+        let codec = if self.encoder.is_some() { format!("Opus {} kbit/s", self.kbps) } else { "L16".to_string() };
         let channels = if self.channels == 1 { "mono" } else { "stereo" };
         let secure = if self.key.is_some() { ", encrypted" } else { ", not encrypted" };
         format!("{codec} {channels}{secure}")
     }
+}
+
+/// An Opus encoder for music at `kbps` kbit/s.
+pub fn opus_encoder(rate: u32, channels: opus::Channels, kbps: u32) -> Result<opus::Encoder, opus::Error> {
+    let mut encoder = opus::Encoder::new(rate, channels, opus::Application::Audio)?;
+    encoder.set_bitrate(opus::Bitrate::Bits(kbps as i32 * 1000))?;
+    Ok(encoder)
 }
 
 /// Read raw big-endian 16-bit PCM from stdin (e.g. `ffmpeg ... -f s16be -`) and send it as RTP
@@ -254,7 +266,7 @@ mod tests {
     fn sends_encrypted_opus_in_20_ms_packets() {
         let receiver = receiver();
         let key = Key::parse(&secure::generate().unwrap()).unwrap();
-        let encoding = Encoding { opus: true, key: Some(key.clone()) };
+        let encoding = Encoding { opus: true, key: Some(key.clone()), kbps: None };
         let mut sender = RtpSender::connect(receiver.local_addr().unwrap(), 48_000, 2, encoding).unwrap();
         sender.push(&vec![0u8; 960 * 4 * 2]).unwrap(); // 40 ms: two packets
         let mut buf = [0u8; 2048];
@@ -276,7 +288,7 @@ mod tests {
     #[test]
     fn opus_timestamps_run_at_48_khz_whatever_the_rate() {
         let receiver = receiver();
-        let encoding = Encoding { opus: true, key: None };
+        let encoding = Encoding { opus: true, key: None, kbps: None };
         let mut sender = RtpSender::connect(receiver.local_addr().unwrap(), 8_000, 1, encoding).unwrap();
         sender.push(&vec![0u8; 160 * 2 * 2]).unwrap(); // two 20 ms packets at 8 kHz mono
         let mut buf = [0u8; 2048];
@@ -286,6 +298,23 @@ mod tests {
             stamps.push(u32::from_be_bytes(buf[4..8].try_into().unwrap()));
         }
         assert_eq!(stamps[1].wrapping_sub(stamps[0]), 960);
+    }
+
+    #[test]
+    fn a_lower_bit_rate_makes_smaller_packets() {
+        let size = |kbps| {
+            let receiver = receiver();
+            let encoding = Encoding { opus: true, key: None, kbps: Some(kbps) };
+            let mut sender = RtpSender::connect(receiver.local_addr().unwrap(), 48_000, 2, encoding).unwrap();
+            // Noise, so the encoder uses the bits it is given; the last of 10 packets.
+            let noise: Vec<u8> = (0u32..960 * 4 * 10).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+            sender.push(&noise).unwrap();
+            let mut buf = [0u8; 4096];
+            (0..10).map(|_| receiver.recv(&mut buf).unwrap()).last().unwrap()
+        };
+        let (low, high) = (size(32), size(256));
+        // 20 ms at 32 kbit/s is 80 bytes, at 256 kbit/s 640 (plus the 12-byte header).
+        assert!(low < 140 && high > 400, "{low} vs {high} bytes");
     }
 
     #[test]

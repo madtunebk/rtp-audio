@@ -59,6 +59,8 @@ test('sender preview respects web/microphone', async ({ page }) => {
   await page.locator('.nav-item').nth(1).click();
   await page.getByLabel('Delivery').selectOption({ label: 'Browsers (noVNC, ws://)' });
   await page.getByLabel('Allow browser microphone').check();
+  await page.getByLabel('Opus bit rate').selectOption({ label: '64 kbit/s · slow links' });
+  await expect(page.locator('.command-panel code')).toContainText('--bitrate 64');
   await expect(page.locator('.command-panel code')).toContainText('--web');
   await expect(page.locator('.command-panel code')).toContainText('--mic');
   await page.getByLabel('Source', { exact: true }).fill("test's source");
