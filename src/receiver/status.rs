@@ -11,6 +11,8 @@ struct Snapshot {
     stats: Vec<Stats>,
     buffered: usize,
     labels: Vec<String>,
+    /// Per output: sound buffered here and the device's own latency, in ms.
+    timing: Vec<(f32, f32)>,
     spectrum: Option<[f32; super::spectrum::BANDS]>,
     level: f32,
     packets: u32,
@@ -28,6 +30,7 @@ pub(super) struct Monitor {
     packets: u32,
     heard: Instant,
     last: Instant,
+    rate: u32,
 }
 impl Monitor {
     pub(super) fn new(rate: u32, json: Option<Vec<String>>) -> Self {
@@ -40,7 +43,7 @@ impl Monitor {
             }
         });
         let now = Instant::now();
-        Self { live, publish, sender: None, description: String::new(), packets: 0, heard: now, last: now }
+        Self { live, publish, sender: None, description: String::new(), packets: 0, heard: now, last: now, rate }
     }
     pub(super) fn arrived(&mut self, from: &str, describe: impl FnOnce() -> String) {
         self.packets = self.packets.saturating_add(1);
@@ -74,6 +77,11 @@ impl Monitor {
             stats,
             buffered,
             labels,
+            timing: jitter
+                .0
+                .iter()
+                .map(|(_, feed)| (feed.metrics.state().1 as f32 * 1000.0 / self.rate as f32, feed.metrics.device_latency_ms()))
+                .collect(),
             spectrum: jitter.1.as_ref().and_then(|tap| tap.latest()),
             level: f32::from_bits(peak.swap(0, Ordering::Relaxed)),
             packets: self.packets,
@@ -132,7 +140,7 @@ impl Reporter {
     }
 
     fn tick(&mut self, snapshot: Snapshot) {
-        let Snapshot { stats, buffered, labels, spectrum, level, packets, sender, description, heard, errors } = snapshot;
+        let Snapshot { stats, buffered, labels, timing, spectrum, level, packets, sender, description, heard, errors } = snapshot;
         self.packets += packets.saturating_sub(self.total_packets);
         self.total_packets = packets;
         if heard != self.last_packet {
@@ -171,7 +179,7 @@ impl Reporter {
                 let level = std::mem::replace(&mut self.level_peak, 0.);
                 let waiting = self.last_packet.elapsed() > Duration::from_secs(1);
                 let rate = self.packets as f32 / seconds;
-                println!("{}", json_status(self.sender.as_deref(), waiting, rate, buffered * 1000 / self.rate as usize, &labels, ids, &stats, level));
+                println!("{}", json_status(self.sender.as_deref(), waiting, rate, buffered * 1000 / self.rate as usize, &labels, ids, &stats, &timing, level));
                 (self.last_status, self.packets) = (Instant::now(), 0);
             }
         } else if self.live && self.last_status.elapsed() >= STATUS_EVERY {
@@ -218,7 +226,17 @@ const SPECTRUM_EVERY: Duration = Duration::from_millis(50);
 /// {"status":{"sender":"192.168.1.5:40000","waiting":false,"packets":50,"buffer_ms":60,"level_db":-12.3,
 ///  "lost":0,"late":0,"outputs":[{"name":"HDMI 2","id":"alsa:hw:…","dropouts":0,"skips":0,"card":0}]}}
 #[allow(clippy::too_many_arguments)]
-fn json_status(sender: Option<&str>, waiting: bool, rate: f32, buffer_ms: usize, labels: &[&str], ids: &[String], stats: &[Stats], level: f32) -> String {
+fn json_status(
+    sender: Option<&str>,
+    waiting: bool,
+    rate: f32,
+    buffer_ms: usize,
+    labels: &[&str],
+    ids: &[String],
+    stats: &[Stats],
+    timing: &[(f32, f32)],
+    level: f32,
+) -> String {
     use crate::json::string;
     let sender = sender.map_or("null".to_string(), string);
     let level = if level > 1e-4 { format!("{:.1}", 20.0 * level.log10()) } else { "null".to_string() };
@@ -227,7 +245,17 @@ fn json_status(sender: Option<&str>, waiting: bool, rate: f32, buffer_ms: usize,
         .iter()
         .zip(ids)
         .zip(stats)
-        .map(|((name, id), s)| format!(r#"{{"name":{},"id":{},"dropouts":{},"skips":{},"card":{}}}"#, string(name), string(id), s.underruns, s.trimmed, s.card))
+        .zip(timing)
+        .map(|(((name, id), s), (buffer_ms, device_ms))| {
+            format!(
+                r#"{{"name":{},"id":{},"buffer_ms":{buffer_ms:.1},"device_ms":{device_ms:.1},"dropouts":{},"skips":{},"card":{}}}"#,
+                string(name),
+                string(id),
+                s.underruns,
+                s.trimmed,
+                s.card
+            )
+        })
         .collect();
     format!(
         r#"{{"status":{{"sender":{sender},"waiting":{waiting},"packets":{rate:.0},"buffer_ms":{buffer_ms},"level_db":{level},"lost":{lost},"late":{late},"outputs":[{}]}}}}"#,
@@ -345,7 +373,7 @@ mod tests {
     fn stalled_telemetry_consumer_cannot_backpressure_reception() {
         let (publish, receiver) = std::sync::mpsc::sync_channel(2);
         let now = Instant::now();
-        let mut monitor = Monitor { live: false, publish, sender: None, description: String::new(), packets: 0, heard: now, last: now };
+        let mut monitor = Monitor { live: false, publish, sender: None, description: String::new(), packets: 0, heard: now, last: now, rate: 48_000 };
         let mut buffers = Buffers(Vec::new(), None);
         let peak = AtomicU32::new(0);
         for i in 0..100 {

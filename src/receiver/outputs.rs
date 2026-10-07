@@ -371,7 +371,10 @@ where
     let metrics = Arc::clone(&jitter.metrics);
     let stream = device.build_output_stream(
         *config,
-        move |data: &mut [T], _| {
+        move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+            let time = info.timestamp();
+            let latency = time.playback.duration_since(time.callback).as_micros() as u64;
+            jitter.metrics.device_latency_us.store(latency, Ordering::Relaxed);
             jitter.prepare_callback(&player, data.len() / channels);
             jitter.refill();
             jitter.update_speed(&mut player);

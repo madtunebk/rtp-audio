@@ -191,6 +191,9 @@ pub(super) struct Metrics {
     underruns: std::sync::atomic::AtomicU64,
     trimmed: std::sync::atomic::AtomicU64,
     buffered: std::sync::atomic::AtomicUsize,
+    /// How long the sound card (or sound server) takes to play what the callback writes, in µs:
+    /// cpal's playback minus callback instant.
+    pub(super) device_latency_us: std::sync::atomic::AtomicU64,
 }
 impl Metrics {
     pub(super) fn state(&self) -> (Stats, usize) {
@@ -205,6 +208,11 @@ impl Metrics {
             },
             self.buffered.load(Relaxed),
         )
+    }
+
+    /// The latency of the output's device, in ms.
+    pub(super) fn device_latency_ms(&self) -> f32 {
+        self.device_latency_us.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
     }
 }
 #[derive(Clone, Copy)]
