@@ -55,19 +55,9 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      # The window (`rtp-audio --gui`): Windows and macOS link it in; on Linux it is a program of
-      # its own carried inside rtp-audio, so rtp-audio itself never links WebKit.
-      - name: Build the window's page
-        run: cd src/gui/web && npm ci && npm run build
-
-      - name: Build the window program (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          cargo build --locked --release --manifest-path src/gui/Cargo.toml
-          echo "RTP_AUDIO_GUI_BIN=$PWD/src/gui/target/release/rtp-audio-gui" >> "$GITHUB_ENV"
-
+      # Complete: the window (`rtp-audio --gui`) is built in, its page by npm from build.rs.
       - name: Build
-        run: cargo build --locked --release --features gui
+        run: cargo build --locked --release
 
       - name: Package
         shell: bash

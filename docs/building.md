@@ -1,9 +1,24 @@
 # Building
 
+One command builds rtp-audio complete, with its window (`rtp-audio --gui`):
+
 ```bash
-sudo apt install libpulse-dev libasound2-dev libdbus-1-dev pkg-config cmake   # Debian/Ubuntu build dependencies
-cargo build --release                                     # this machine: target/release/rtp-audio
+# Debian/Ubuntu build dependencies; and Node.js 20 or newer with npm (https://nodejs.org)
+sudo apt install libpulse-dev libasound2-dev libdbus-1-dev pkg-config cmake \
+                 libwebkit2gtk-4.1-dev libxdo-dev libssl-dev librsvg2-dev
+cargo build --release          # target/release/rtp-audio: the CLI and --gui
 cargo test
+```
+
+The window's page is built by npm and its program by cargo, from the build scripts: nothing to
+run before. On Linux, rtp-audio itself still links no WebKit or GTK: the window is a separate
+program carried inside it and started only for `--gui` (`readelf -d target/release/rtp-audio`).
+
+Without the window, e.g. on a server with no Node or WebKit development files, and kept apart so it
+never replaces the complete one:
+
+```bash
+CARGO_TARGET_DIR=target/headless cargo build --release --no-default-features
 ```
 
 Windows `.exe` from Linux (needs `mingw-w64`):
@@ -13,9 +28,8 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-The window (`rtp-audio --gui`, `--features gui`) needs Node to build its page, and on Linux
-WebKitGTK's development files: see [src/gui/README.md](../src/gui/README.md). Without it,
-`rtp-audio --gui` says so and everything else works.
+Built this way (mingw), the exe needs `WebView2Loader.dll` beside it for the window; the release
+(MSVC) links it in.
 
 ## Runtime requirements and limitations
 

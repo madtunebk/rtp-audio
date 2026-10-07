@@ -19,10 +19,11 @@ tungstenite = "0.30"
 embed-resource = "3"
 
 [features]
-# The window, `rtp-audio --gui` (build its page first: src/gui/README.md). Windows and macOS link it
-# in. On Linux rtp-audio carries it as a separate program, built first, so rtp-audio itself never
-# links WebKit:
-# RTP_AUDIO_GUI_BIN=src/gui/target/release/rtp-audio-gui cargo build --release --features gui
+# The window, `rtp-audio --gui`: built by default (needs Node.js; on Linux WebKitGTK's development
+# files). Windows and macOS link it in; on Linux build.rs builds it as a program of its own that
+# rtp-audio carries, so rtp-audio itself never links WebKit. Without it (servers):
+# cargo build --release --no-default-features
+default = ["gui"]
 gui = ["dep:rtp-audio-gui"]
 
 [profile.release]

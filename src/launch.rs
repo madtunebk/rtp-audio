@@ -40,7 +40,7 @@ mod helper {
     const NAME: &str = if cfg!(windows) { "rtp-audio-gui.exe" } else { "rtp-audio-gui" };
 
     #[cfg(all(feature = "gui", target_os = "linux"))]
-    static EMBEDDED: &[u8] = include_bytes!(env!("RTP_AUDIO_GUI_BIN", "on Linux, --features gui needs RTP_AUDIO_GUI_BIN: the built rtp-audio-gui"));
+    static EMBEDDED: &[u8] = include_bytes!(env!("RTP_AUDIO_GUI_BIN", "build.rs sets RTP_AUDIO_GUI_BIN: the window program it built"));
 
     /// Opens the window; returns when it closes.
     pub fn gui() -> Result<(), Box<dyn Error>> {
@@ -130,8 +130,8 @@ mod helper {
             let beside = me.parent().map(|dir| dir.join(NAME)).filter(|path| path.is_file());
             beside.ok_or_else(|| {
                 format!(
-                    "this rtp-audio has no window: {NAME} isn't next to it ({}). \
-                     release builds carry it inside; from source, see src/gui/README.md",
+                    "this rtp-audio was built without the window (--no-default-features), and {NAME} \
+                     isn't next to it ({})",
                     me.display()
                 )
                 .into()

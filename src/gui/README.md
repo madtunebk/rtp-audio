@@ -1,6 +1,6 @@
 # The window: `rtp-audio --gui`
 
-A Tauri window with a Svelte page, built into rtp-audio with `--features gui`:
+A Tauri window with a Svelte page, built into rtp-audio by default (feature `gui`):
 
 - **Windows, macOS:** the window is part of `rtp-audio(.exe)`; their web views (WebView2,
   WKWebView) come with the system.
@@ -24,35 +24,10 @@ The window still needs the system's web view: WebKitGTK 4.1 on Linux
 
 ## Build
 
-On Ubuntu, building the window needs (see https://v2.tauri.app/start/prerequisites/):
-
-```bash
-sudo apt install libwebkit2gtk-4.1-dev libxdo-dev libssl-dev librsvg2-dev
-```
-
-Build the page first (Node 20 or newer):
-
-```bash
-(cd src/gui/web && npm ci && npm run build)
-```
-
-Windows, macOS:
-
-```bash
-cargo build --release --features gui
-```
-
-Linux: the window program first, then rtp-audio carrying it:
-
-```bash
-cargo build --release --manifest-path src/gui/Cargo.toml
-RTP_AUDIO_GUI_BIN=$PWD/src/gui/target/release/rtp-audio-gui cargo build --release --features gui
-./target/release/rtp-audio --gui
-```
-
-Without `gui`, rtp-audio looks for `rtp-audio-gui` next to itself instead. Cross-built from Linux
-for Windows (`x86_64-pc-windows-gnu`), the exe also needs `WebView2Loader.dll` beside it; the MSVC
-build (the release) links it in.
+Part of the normal build: `cargo build --release` (see [docs/building.md](../../docs/building.md)).
+This crate's build script builds the page with npm (`npm ci` the first time) before embedding it;
+on Linux, rtp-audio's build script builds this crate as a program, in `target/gui-program/`, and
+carries it. `RTP_AUDIO_GUI_BIN` makes it carry an already built one instead.
 
 ## The page
 
