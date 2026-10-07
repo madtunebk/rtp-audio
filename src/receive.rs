@@ -365,7 +365,10 @@ const CARD_PERIOD_MS: u32 = 20;
 fn open_output(device: &cpal::Device, out: Output) -> Result<(cpal::Stream, String), Box<dyn Error>> {
     let supported = device.default_output_config()?;
     let format = supported.sample_format();
-    let direct = alsa_port(&device_id(device)).is_some_and(|port| port.plugin == "hw");
+    let id = device_id(device);
+    // A card opened directly, or an output of the sound server through its own protocol (which
+    // then keeps that latency, asking for sound steadily rather than in big bursts).
+    let direct = alsa_port(&id).is_some_and(|port| port.plugin == "hw") || id.starts_with("pulseaudio:");
     let buffer_size = match supported.buffer_size() {
         cpal::SupportedBufferSize::Range { min, max } if direct => {
             cpal::BufferSize::Fixed((supported.sample_rate() * CARD_PERIOD_MS / 1000).clamp(*min, *max))
@@ -387,44 +390,47 @@ fn open_output(device: &cpal::Device, out: Output) -> Result<(cpal::Stream, Stri
 }
 
 /// The jitter buffers of all the outputs: every frame goes into each.
-struct Buffers(Vec<Arc<Mutex<Jitter>>>);
+struct Buffers(Vec<(String, Arc<Mutex<Jitter>>)>);
 
 impl Buffers {
     fn push(&self, sequence: u16, pcm: &[u8], channels: usize) {
-        for jitter in &self.0 {
+        for (_, jitter) in &self.0 {
             jitter.lock().unwrap().push(sequence, pcm, channels);
         }
     }
 
     /// Packets lost on the way that the jitter buffers saw no gap for (concealed by Opus).
     fn count_lost(&self, packets: u16) {
-        for jitter in &self.0 {
+        for (_, jitter) in &self.0 {
             jitter.lock().unwrap().stats.lost += u64::from(packets);
         }
     }
 
     /// A new sender: drop what's buffered from the last one.
     fn restart(&self) {
-        for jitter in &self.0 {
+        for (_, jitter) in &self.0 {
             jitter.lock().unwrap().restart();
         }
     }
 
-    /// For the status line: the worst of each problem across the outputs, and the emptiest buffer.
-    fn state(&self) -> (Stats, usize) {
-        let mut stats = Stats::default();
+    /// For the status line and reports: each output's totals, and the emptiest buffer.
+    fn state(&self) -> (Vec<Stats>, usize) {
         let mut buffered = usize::MAX;
-        for jitter in &self.0 {
-            let jitter = jitter.lock().unwrap();
-            let s = jitter.stats;
-            stats.lost = stats.lost.max(s.lost);
-            stats.late = stats.late.max(s.late);
-            stats.underruns = stats.underruns.max(s.underruns);
-            stats.trimmed = stats.trimmed.max(s.trimmed);
-            stats.card = stats.card.max(s.card);
-            buffered = buffered.min(jitter.buffered());
-        }
+        let stats = self
+            .0
+            .iter()
+            .map(|(_, jitter)| {
+                let jitter = jitter.lock().unwrap();
+                buffered = buffered.min(jitter.buffered());
+                jitter.stats
+            })
+            .collect();
         (stats, if buffered == usize::MAX { 0 } else { buffered })
+    }
+
+    /// Short names of the outputs, to say which one has problems.
+    fn labels(&self) -> Vec<&str> {
+        self.0.iter().map(|(label, _)| label.as_str()).collect()
     }
 }
 
@@ -446,7 +452,7 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
         match open_output(&device, out) {
             Ok((stream, card)) => {
                 cards.push((device_name(&device), card));
-                buffers.push(jitter);
+                buffers.push((short_name(&device_name(&device)), jitter));
                 streams.push(stream);
             }
             // With several outputs, one that won't open is skipped: the others still play.
@@ -694,9 +700,10 @@ struct Monitor {
     sender: Option<String>,
     packets: u32,
     last_status: Instant,
-    shown: Stats,
+    /// Per output, the totals the status line and the reports last counted from.
+    shown: Vec<Stats>,
     last_report: Instant,
-    reported: Stats,
+    reported: Vec<Stats>,
     last_packet: Instant,
     silent_reported: bool,
 }
@@ -711,9 +718,9 @@ impl Monitor {
             sender: None,
             packets: 0,
             last_status: now,
-            shown: Stats::default(),
+            shown: Vec::new(),
             last_report: now,
-            reported: Stats::default(),
+            reported: Vec::new(),
             last_packet: now,
             silent_reported: true,
         }
@@ -740,11 +747,21 @@ impl Monitor {
 
     fn tick(&mut self, jitter: &Buffers, peak: &AtomicU32) {
         let (stats, buffered) = jitter.state();
+        self.shown.resize(stats.len(), Stats::default());
+        self.reported.resize(stats.len(), Stats::default());
+        let labels = jitter.labels();
         if self.live && self.last_status.elapsed() >= STATUS_EVERY {
             let seconds = self.last_status.elapsed().as_secs_f32();
             let level = f32::from_bits(peak.swap(0, Ordering::Relaxed));
             let waiting = self.last_packet.elapsed() > Duration::from_secs(1);
-            let line = status_line(self.sender.as_deref(), waiting, self.packets as f32 / seconds, buffered * 1000 / self.rate as usize, &stats, &self.shown, level);
+            let line = status_line(
+                self.sender.as_deref(),
+                waiting,
+                self.packets as f32 / seconds,
+                buffered * 1000 / self.rate as usize,
+                Problems { labels: &labels, now: &stats, since: &self.shown },
+                level,
+            );
             print!("\r{line}");
             let _ = std::io::stdout().flush();
             (self.last_status, self.packets) = (Instant::now(), 0);
@@ -753,7 +770,7 @@ impl Monitor {
             }
         } else if !self.live {
             if self.last_report.elapsed() >= REPORT_EVERY && stats != self.reported {
-                report(&self.reported, &stats);
+                report(Problems { labels: &labels, now: &stats, since: &self.reported });
                 self.reported = stats;
                 self.last_report = Instant::now();
             }
@@ -768,22 +785,66 @@ impl Monitor {
 const STATUS_EVERY: Duration = Duration::from_millis(250);
 const STATUS_WIDTH: usize = 100;
 
-/// The live status line: who, how much, how full the buffer is, problems, and a level meter.
-fn status_line(sender: Option<&str>, waiting: bool, rate: f32, buffer_ms: usize, now: &Stats, since: &Stats, level: f32) -> String {
+/// What went wrong on each output since some earlier totals. Network problems (lost, late) are
+/// the same for every output, so they're counted once; playing problems belong to an output.
+struct Problems<'a> {
+    labels: &'a [&'a str],
+    now: &'a [Stats],
+    since: &'a [Stats],
+}
+
+impl Problems<'_> {
+    /// Network problems: lost and late packets.
+    fn network(&self) -> (u64, u64) {
+        match (self.now.first(), self.since.first()) {
+            (Some(now), Some(since)) => (now.lost - since.lost, now.late - since.late),
+            _ => (0, 0),
+        }
+    }
+
+    /// Playing problems of each output: dropouts, skips, sound card hiccups.
+    fn playing(&self) -> impl Iterator<Item = (&str, u64, u64, u64)> + '_ {
+        self.labels.iter().zip(self.now.iter().zip(self.since)).map(|(label, (now, since))| {
+            (*label, now.underruns - since.underruns, now.trimmed - since.trimmed, now.card - since.card)
+        })
+    }
+
+    fn total(&self) -> u64 {
+        let (lost, late) = self.network();
+        lost + late + self.playing().map(|(_, a, b, c)| a + b + c).sum::<u64>()
+    }
+
+    /// The outputs with playing problems, when there are several outputs.
+    fn troubled(&self) -> Vec<&str> {
+        if self.labels.len() < 2 {
+            return Vec::new();
+        }
+        self.playing().filter(|(_, a, b, c)| a + b + c > 0).map(|(label, ..)| label).collect()
+    }
+}
+
+/// The live status line: who, how much, how full the buffer is, problems (and on which output,
+/// with several), and a level meter.
+fn status_line(sender: Option<&str>, waiting: bool, rate: f32, buffer_ms: usize, problems: Problems, level: f32) -> String {
     let line = match sender {
         None => "Waiting for sound…".to_string(),
-        Some(_) if waiting => format!("Waiting for sound… (problems so far: {} lost, {} dropouts)", now.lost, now.underruns),
+        Some(_) if waiting => {
+            let lost = problems.now.iter().map(|s| s.lost).max().unwrap_or(0);
+            let dropouts = problems.now.iter().map(|s| s.underruns).max().unwrap_or(0);
+            format!("Waiting for sound… (problems so far: {lost} lost, {dropouts} dropouts)")
+        }
         Some(from) => {
             let db = 20.0 * level.max(1e-6).log10();
             let bars = (((db + 60.0) / 60.0).clamp(0.0, 1.0) * 20.0).round() as usize;
-            let problems = (now.lost - since.lost)
-                + (now.late - since.late)
-                + (now.underruns - since.underruns)
-                + (now.trimmed - since.trimmed)
-                + (now.card - since.card);
+            let total = problems.total();
+            let troubled = problems.troubled();
+            let state = match (total, troubled.as_slice()) {
+                (0, _) => "ok".to_string(),
+                (n, []) => format!("{n} problem(s) just now"),
+                (n, outputs) => format!("{n} problem(s) just now ({})", outputs.join(", ")),
+            };
             format!(
-                "{from}  {rate:>3.0} pkt/s  buffer {buffer_ms:>3} ms  {}  [{}{}] {:>4}",
-                if problems > 0 { format!("{problems} problem(s) just now") } else { "ok".to_string() },
+                "{from}  {rate:>3.0} pkt/s  buffer {buffer_ms:>3} ms  {state}  [{}{}] {:>4}",
                 "█".repeat(bars),
                 " ".repeat(20 - bars),
                 if level > 1e-4 { format!("{db:.0}dB") } else { "--".to_string() }
@@ -795,21 +856,46 @@ fn status_line(sender: Option<&str>, waiting: bool, rate: f32, buffer_ms: usize,
 
 const REPORT_EVERY: Duration = Duration::from_secs(5);
 
-/// One line of what went wrong since the last report.
-fn report(before: &Stats, now: &Stats) {
+/// One line of what went wrong since the last report; with several outputs, each output's
+/// playing problems under its name.
+fn report(problems: Problems) {
     let mut parts = Vec::new();
-    for (count, what) in [
-        (now.lost - before.lost, "packets lost on the network"),
-        (now.late - before.late, "packets arrived too late"),
-        (now.underruns - before.underruns, "dropouts (packets came too slowly: try a bigger --latency)"),
-        (now.trimmed - before.trimmed, "skips (packets came in a burst)"),
-        (now.card - before.card, "sound card underruns or overruns"),
-    ] {
+    let (lost, late) = problems.network();
+    for (count, what) in [(lost, "packets lost on the network"), (late, "packets arrived too late")] {
         if count > 0 {
             parts.push(format!("{count} {what}"));
         }
     }
-    println!("Last {} s: {}", REPORT_EVERY.as_secs(), parts.join(", "));
+    let several = problems.labels.len() > 1;
+    for (label, dropouts, skips, card) in problems.playing() {
+        let mut own = Vec::new();
+        for (count, what) in [
+            (dropouts, "dropouts (packets came too slowly: try a bigger --latency)"),
+            (skips, "skips (packets came in a burst)"),
+            (card, "sound card underruns or overruns"),
+        ] {
+            if count > 0 {
+                own.push(format!("{count} {what}"));
+            }
+        }
+        if !own.is_empty() {
+            parts.push(if several { format!("{label}: {}", own.join(", ")) } else { own.join(", ") });
+        }
+    }
+    println!("Last {} s: {}", REPORT_EVERY.as_secs(), parts.join("; "));
+}
+
+/// A short name for an output on the status line: the part in brackets at the end ("… Digital
+/// Stereo (HDMI 2)" → "HDMI 2"), else the port after the card ("HDA NVidia, HDMI 3" → "HDMI 3"),
+/// else the name; at most 24 characters.
+fn short_name(name: &str) -> String {
+    let short = name
+        .strip_suffix(')')
+        .and_then(|rest| rest.rfind('(').map(|i| &rest[i + 1..]))
+        .filter(|inside| !inside.is_empty())
+        .or_else(|| name.rsplit_once(", ").map(|(_, port)| port))
+        .unwrap_or(name);
+    short.chars().take(24).collect()
 }
 
 /// A UDP socket with a big receive buffer: Windows' default is small enough that a short
@@ -990,6 +1076,13 @@ mod tests {
         assert!(frames(&mut unpacker, &with_type(0, &[0; 960])).is_empty()); // PCMU
         assert!(frames(&mut unpacker, &with_type(8, &[0; 960])).is_empty()); // PCMA
         assert!(frames(&mut unpacker, &with_type(rtp::L16, &[0; 961])).is_empty()); // a broken frame
+    }
+
+    #[test]
+    fn short_output_names() {
+        assert_eq!(super::short_name("GA106 High Definition Audio Controller Digital Stereo (HDMI 2)"), "HDMI 2");
+        assert_eq!(super::short_name("Bose Flex SoundLink"), "Bose Flex SoundLink");
+        assert_eq!(super::short_name("HD-Audio Generic, ALC897 Analog"), "ALC897 Analog");
     }
 
     #[test]

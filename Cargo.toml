@@ -17,6 +17,9 @@ tungstenite = "0.30"
 strip = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# Play through the sound server (PipeWire or PulseAudio) when it runs: its outputs, shared with
+# other programs and buffered by it, instead of sound cards opened directly. ALSA otherwise.
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
 libc = "0.2"
 libpulse-binding = "2.30"
 signal-hook = "0.4"
