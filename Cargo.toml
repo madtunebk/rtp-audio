@@ -30,3 +30,6 @@ cpal = { version = "0.18.2", features = ["pulseaudio", "realtime-dbus"] }
 libc = "0.2"
 libpulse-binding = "2.30"
 signal-hook = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

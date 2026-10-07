@@ -959,6 +959,7 @@ dependencies = [
  "signal-hook",
  "socket2",
  "tungstenite",
+ "windows-sys",
 ]
 
 [[package]]

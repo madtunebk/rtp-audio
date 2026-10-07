@@ -100,12 +100,30 @@ fn start(app: AppHandle, running: State<Running>, args: Vec<String>) -> Result<u
     {
         return Err("rtp-audio is already running; stop it first".into());
     }
-    let mut child = rtp_audio()
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("can't run {}: {err}", binary().display()))?;
+    let mut command = rtp_audio();
+    command.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // If this window goes away without stopping it (killed, crashed), rtp-audio still stops: on
+    // Linux it gets the Ctrl+C a Stop would send (so a sender switches the sound back), on Windows
+    // the system ends it with this process.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        let window = libc::getpid();
+        command.pre_exec(move || {
+            // Ctrl+C must stop it even when this window was started with SIGINT ignored (as a
+            // background job is), since ignored signals are inherited.
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGINT);
+            // The window ended before that took effect: stop now.
+            if libc::getppid() != window {
+                libc::raise(libc::SIGINT);
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|err| format!("can't run {}: {err}", binary().display()))?;
+    #[cfg(windows)]
+    end_with_this_process(&child);
     let run = {
         let mut next = running.next.lock().unwrap();
         *next += 1;
@@ -126,6 +144,34 @@ fn start(app: AppHandle, running: State<Running>, args: Vec<String>) -> Result<u
         app.emit("rtp-exit", Exit { run, code }).ok();
     });
     Ok(run)
+}
+
+/// Ties `child` to this process: Windows ends it when this process ends, however that happens
+/// (closed, killed, crashed), through a job object that kills its processes when its last handle
+/// closes. The handle is kept for the life of the process on purpose.
+#[cfg(windows)]
+fn end_with_this_process(child: &std::process::Child) {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    static JOB: OnceLock<usize> = OnceLock::new();
+    let job = *JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return 0;
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const limits).cast(), size);
+        job as usize
+    });
+    if job != 0 {
+        unsafe { AssignProcessToJobObject(job as _, child.as_raw_handle() as _) };
+    }
 }
 
 /// Sends each line from `pipe` to the page. Status lines rewrite themselves with \r at a

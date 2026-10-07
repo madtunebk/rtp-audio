@@ -27,8 +27,40 @@ pub fn gui() -> Result<(), Box<dyn Error>> {
     }
     #[cfg(not(unix))]
     {
-        let status = command.status()?;
+        // Closing this console also closes the window (and so what it runs).
+        let mut child = command.spawn()?;
+        #[cfg(windows)]
+        end_with_this_process(&child);
+        let status = child.wait()?;
         if status.success() { Ok(()) } else { Err(format!("the window ended with {status}").into()) }
+    }
+}
+
+/// Ties `child` to this process: Windows ends it when this process ends, however that happens
+/// (closed, killed, crashed), through a job object that kills its processes when its last handle
+/// closes. The handle is kept for the life of the process on purpose.
+#[cfg(windows)]
+fn end_with_this_process(child: &std::process::Child) {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    static JOB: OnceLock<usize> = OnceLock::new();
+    let job = *JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return 0;
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const limits).cast(), size);
+        job as usize
+    });
+    if job != 0 {
+        unsafe { AssignProcessToJobObject(job as _, child.as_raw_handle() as _) };
     }
 }
 
