@@ -223,6 +223,7 @@ pub(super) fn receive_udp(options: &Options, card: &str, jitter: &mut Buffers, p
                     _ => {}
                 }
                 active = Some((from, packet.ssrc, Instant::now()));
+                let size = payload.len();
                 let frames = unpacker.frames(packet.ssrc, packet.sequence, payload_type, payload);
                 if unpacker.concealed > 0 {
                     jitter.count_lost(unpacker.concealed);
@@ -230,7 +231,7 @@ pub(super) fn receive_udp(options: &Options, card: &str, jitter: &mut Buffers, p
                 if frames.is_empty() {
                     continue;
                 }
-                monitor.arrived(&from.to_string(), || {
+                monitor.arrived(&from.to_string(), size, || {
                     let codec = if payload_type == rtp::OPUS { "Opus" } else { "L16" };
                     format!("{codec}, {}", if encrypted { "encrypted" } else { "not encrypted" })
                 });

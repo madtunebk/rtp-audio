@@ -88,7 +88,7 @@ pub(super) fn websocket_session(target: &WsTarget, options: &Options, jitter: &m
                 frame.extend(pcm[..samples * channels].iter().flat_map(|s| s.to_be_bytes()));
                 jitter.push(*sequence, &frame, channels);
                 *sequence = sequence.wrapping_add(1);
-                monitor.arrived(&peer, || "Opus over TCP".to_string());
+                monitor.arrived(&peer, data.len(), || "Opus over TCP".to_string());
             }
             // A sender stopped with Ctrl+C just drops the connection: that's an ordinary end too.
             Ok(Message::Close(_))

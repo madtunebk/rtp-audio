@@ -201,7 +201,7 @@
     if (mode === 'send') return `Sending · ${clock(elapsed)}`;
     if (!status) return 'Starting…';
     if (!status.sender || status.waiting) return `Waiting for sound… · ${clock(elapsed)}`;
-    return `${status.sender} · ${status.packets} pkt/s · buffer ${status.buffer_ms} ms · ${status.lost} lost · ${clock(elapsed)}`;
+    return `${status.sender} · ${status.kbps ?? '?'} kbit/s · ${status.packets} pkt/s · buffer ${status.buffer_ms} ms · ${status.lost} lost · ${clock(elapsed)}`;
   }
 </script>
 

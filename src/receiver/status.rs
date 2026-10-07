@@ -16,6 +16,8 @@ struct Snapshot {
     spectrum: Option<[f32; super::spectrum::BANDS]>,
     level: f32,
     packets: u32,
+    /// Sound received so far (codec payload, no headers), in bytes.
+    bytes: u64,
     sender: Option<String>,
     description: String,
     heard: Instant,
@@ -28,6 +30,7 @@ pub(super) struct Monitor {
     sender: Option<String>,
     description: String,
     packets: u32,
+    bytes: u64,
     heard: Instant,
     last: Instant,
     rate: u32,
@@ -43,10 +46,12 @@ impl Monitor {
             }
         });
         let now = Instant::now();
-        Self { live, publish, sender: None, description: String::new(), packets: 0, heard: now, last: now, rate }
+        Self { live, publish, sender: None, description: String::new(), packets: 0, bytes: 0, heard: now, last: now, rate }
     }
-    pub(super) fn arrived(&mut self, from: &str, describe: impl FnOnce() -> String) {
+    /// A packet of `bytes` of sound (its codec payload) arrived from `from`.
+    pub(super) fn arrived(&mut self, from: &str, bytes: usize, describe: impl FnOnce() -> String) {
         self.packets = self.packets.saturating_add(1);
+        self.bytes += bytes as u64;
         self.heard = Instant::now();
         if self.sender.as_deref() != Some(from) {
             self.sender = Some(from.to_owned());
@@ -85,6 +90,7 @@ impl Monitor {
             spectrum: jitter.1.as_ref().and_then(|tap| tap.latest()),
             level: f32::from_bits(peak.swap(0, Ordering::Relaxed)),
             packets: self.packets,
+            bytes: self.bytes,
             sender: self.sender.clone(),
             description: self.description.clone(),
             heard: self.heard,
@@ -104,6 +110,9 @@ struct Reporter {
     sender: Option<String>,
     packets: u32,
     total_packets: u32,
+    /// Sound bytes since the status was last shown, and in all.
+    bytes: u64,
+    total_bytes: u64,
     level_peak: f32,
     announced_errors: std::collections::HashSet<String>,
     last_status: Instant,
@@ -127,6 +136,8 @@ impl Reporter {
             sender: None,
             packets: 0,
             total_packets: 0,
+            bytes: 0,
+            total_bytes: 0,
             level_peak: 0.,
             announced_errors: std::collections::HashSet::new(),
             last_status: now,
@@ -140,9 +151,11 @@ impl Reporter {
     }
 
     fn tick(&mut self, snapshot: Snapshot) {
-        let Snapshot { stats, buffered, labels, timing, spectrum, level, packets, sender, description, heard, errors } = snapshot;
+        let Snapshot { stats, buffered, labels, timing, spectrum, level, packets, bytes, sender, description, heard, errors } = snapshot;
         self.packets += packets.saturating_sub(self.total_packets);
         self.total_packets = packets;
+        self.bytes += bytes.saturating_sub(self.total_bytes);
+        self.total_bytes = bytes;
         if heard != self.last_packet {
             self.silent_reported = false;
         }
@@ -179,8 +192,9 @@ impl Reporter {
                 let level = std::mem::replace(&mut self.level_peak, 0.);
                 let waiting = self.last_packet.elapsed() > Duration::from_secs(1);
                 let rate = self.packets as f32 / seconds;
-                println!("{}", json_status(self.sender.as_deref(), waiting, rate, buffered * 1000 / self.rate as usize, &labels, ids, &stats, &timing, level));
-                (self.last_status, self.packets) = (Instant::now(), 0);
+                let kbps = self.bytes as f32 * 8.0 / 1000.0 / seconds;
+                println!("{}", json_status(self.sender.as_deref(), waiting, rate, kbps, buffered * 1000 / self.rate as usize, &labels, ids, &stats, &timing, level));
+                (self.last_status, self.packets, self.bytes) = (Instant::now(), 0, 0);
             }
         } else if self.live && self.last_status.elapsed() >= STATUS_EVERY {
             let seconds = self.last_status.elapsed().as_secs_f32();
@@ -190,13 +204,14 @@ impl Reporter {
                 self.sender.as_deref(),
                 waiting,
                 self.packets as f32 / seconds,
+                self.bytes as f32 * 8.0 / 1000.0 / seconds,
                 buffered * 1000 / self.rate as usize,
                 Problems { labels: &labels, now: &stats, since: &self.shown },
                 level,
             );
             print!("\r{line}");
             let _ = std::io::stdout().flush();
-            (self.last_status, self.packets) = (Instant::now(), 0);
+            (self.last_status, self.packets, self.bytes) = (Instant::now(), 0, 0);
             if stats != self.shown && self.last_report.elapsed() >= REPORT_EVERY {
                 (self.shown, self.last_report) = (stats, Instant::now());
             }
@@ -220,16 +235,18 @@ pub(super) const STATUS_EVERY: Duration = Duration::from_millis(250);
 const JSON_EVERY: Duration = Duration::from_millis(500);
 const SPECTRUM_EVERY: Duration = Duration::from_millis(50);
 
-/// The status for a program: who sends, packets per second, the emptiest buffer, the level (dB,
+/// The status for a program: who sends, packets per second, the sound's bit rate (kbit/s, codec
+/// payload), the emptiest buffer, the level (dB,
 /// null when silent), the network problems and each output's playing problems (by its ID from
 /// `devices --json`), as totals since the start, on one line:
-/// {"status":{"sender":"192.168.1.5:40000","waiting":false,"packets":50,"buffer_ms":60,"level_db":-12.3,
+/// {"status":{"sender":"192.168.1.5:40000","waiting":false,"packets":50,"kbps":128,"buffer_ms":60,"level_db":-12.3,
 ///  "lost":0,"late":0,"outputs":[{"name":"HDMI 2","id":"alsa:hw:…","dropouts":0,"skips":0,"card":0}]}}
 #[allow(clippy::too_many_arguments)]
 fn json_status(
     sender: Option<&str>,
     waiting: bool,
     rate: f32,
+    kbps: f32,
     buffer_ms: usize,
     labels: &[&str],
     ids: &[String],
@@ -258,7 +275,7 @@ fn json_status(
         })
         .collect();
     format!(
-        r#"{{"status":{{"sender":{sender},"waiting":{waiting},"packets":{rate:.0},"buffer_ms":{buffer_ms},"level_db":{level},"lost":{lost},"late":{late},"outputs":[{}]}}}}"#,
+        r#"{{"status":{{"sender":{sender},"waiting":{waiting},"packets":{rate:.0},"kbps":{kbps:.0},"buffer_ms":{buffer_ms},"level_db":{level},"lost":{lost},"late":{late},"outputs":[{}]}}}}"#,
         outputs.join(",")
     )
 }
@@ -304,9 +321,9 @@ impl Problems<'_> {
     }
 }
 
-/// The live status line: who, how much, how full the buffer is, problems (and on which output,
+/// The live status line: who, how much (packets, and the sound's bit rate), how full the buffer is, problems (and on which output,
 /// with several), and a level meter.
-pub(super) fn status_line(sender: Option<&str>, waiting: bool, rate: f32, buffer_ms: usize, problems: Problems, level: f32) -> String {
+pub(super) fn status_line(sender: Option<&str>, waiting: bool, rate: f32, kbps: f32, buffer_ms: usize, problems: Problems, level: f32) -> String {
     let line = match sender {
         None => "Waiting for sound...".to_string(),
         Some(_) if waiting => {
@@ -325,7 +342,7 @@ pub(super) fn status_line(sender: Option<&str>, waiting: bool, rate: f32, buffer
                 (n, outputs) => format!("{n} problem(s) just now ({})", outputs.join(", ")),
             };
             format!(
-                "{from}  {rate:>3.0} pkt/s  buffer {buffer_ms:>3} ms  {state}  [{}{}] {:>4}",
+                "{from}  {rate:>3.0} pkt/s  {kbps:>4.0} kbit/s  buffer {buffer_ms:>3} ms  {state}  [{}{}] {:>4}",
                 "█".repeat(bars),
                 " ".repeat(20 - bars),
                 if level > 1e-4 { format!("{db:.0}dB") } else { "--".to_string() }
@@ -373,11 +390,11 @@ mod tests {
     fn stalled_telemetry_consumer_cannot_backpressure_reception() {
         let (publish, receiver) = std::sync::mpsc::sync_channel(2);
         let now = Instant::now();
-        let mut monitor = Monitor { live: false, publish, sender: None, description: String::new(), packets: 0, heard: now, last: now, rate: 48_000 };
+        let mut monitor = Monitor { live: false, publish, sender: None, description: String::new(), packets: 0, bytes: 0, heard: now, last: now, rate: 48_000 };
         let mut buffers = Buffers(Vec::new(), None);
         let peak = AtomicU32::new(0);
         for i in 0..100 {
-            monitor.arrived("127.0.0.1", || "test".into());
+            monitor.arrived("127.0.0.1", 100, || "test".into());
             monitor.last = Instant::now() - SPECTRUM_EVERY;
             monitor.tick(&mut buffers, &peak);
             assert_eq!(monitor.packets, i + 1);
