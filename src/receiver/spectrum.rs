@@ -42,6 +42,9 @@ impl Spectrum {
             let low = 30.0 * (16000.0f32 / 30.0).powf(i as f32 / BANDS as f32);
             let high = 30.0 * (16000.0f32 / 30.0).powf((i + 1) as f32 / BANDS as f32);
             let first = ((low / step).ceil() as usize).max(1);
+            if first >= SIZE / 2 {
+                continue;
+            } // Bands above Nyquist are silent at low sample rates.
             let last = ((high / step).ceil() as usize).clamp(first + 1, SIZE / 2);
             let loudest = (first..last).map(magnitude).fold(0.0, f32::max);
             *band = ((20.0 * loudest.max(1e-6).log10() + 100.0) / 70.0).clamp(0.0, 1.0);
@@ -82,17 +85,60 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
     }
 }
 
+/// Optional analysis worker: a stalled renderer can only lose spectrum updates.
+pub(super) struct Tap {
+    input: std::sync::mpsc::SyncSender<(Vec<u8>, usize)>,
+    latest: std::sync::Arc<std::sync::Mutex<Option<[f32; BANDS]>>>,
+}
+impl Tap {
+    pub(super) fn new(rate: u32) -> Self {
+        let (input, receiver) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(2);
+        let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let published = latest.clone();
+        std::thread::spawn(move || {
+            let mut spectrum = Spectrum::new(rate);
+            let mut last = std::time::Instant::now();
+            while let Ok((pcm, channels)) = receiver.recv() {
+                spectrum.feed(&pcm, channels);
+                if last.elapsed() >= std::time::Duration::from_millis(50) {
+                    let bands = spectrum.bands();
+                    if let Ok(mut slot) = published.try_lock() {
+                        *slot = Some(bands);
+                    }
+                    last = std::time::Instant::now();
+                }
+            }
+        });
+        Self { input, latest }
+    }
+    pub(super) fn feed(&self, pcm: &[u8], channels: usize) {
+        let _ = self.input.try_send((pcm.to_vec(), channels));
+    }
+    pub(super) fn latest(&self) -> Option<[f32; BANDS]> {
+        self.latest.try_lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn a_tone_lights_its_band() {
         let mut spectrum = super::Spectrum::new(48_000);
-        let pcm: Vec<u8> = (0..4096).flat_map(|i| (((i as f32 * 2.0 * std::f32::consts::PI * 1000.0 / 48_000.0).sin() * 16000.0) as i16).to_be_bytes()).collect();
+        let pcm: Vec<u8> =
+            (0..4096).flat_map(|i| (((i as f32 * 2.0 * std::f32::consts::PI * 1000.0 / 48_000.0).sin() * 16000.0) as i16).to_be_bytes()).collect();
         spectrum.feed(&pcm, 1);
         let bands = spectrum.bands();
         let loudest = (0..super::BANDS).max_by(|&a, &b| bands[a].total_cmp(&bands[b])).unwrap();
         // 1 kHz is in band 64·log(1000/30)/log(16000/30) ≈ 35.
         assert!((34..=36).contains(&loudest), "loudest band {loudest}");
         assert!(bands[loudest] > 0.9 && bands[5] < 0.3, "{bands:?}");
+    }
+    #[test]
+    fn bands_above_nyquist_are_silent_at_low_rates() {
+        for rate in [8000, 16000, 32000, 48000, 192000] {
+            let bands = super::Spectrum::new(rate).bands();
+            assert!(bands.iter().all(|v| v.is_finite()));
+            assert_eq!(bands[super::BANDS - 1], 0.);
+        }
     }
 }

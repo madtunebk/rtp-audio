@@ -4,6 +4,14 @@
 Every few seconds the receiver prints what went wrong (lost packets, dropouts, skips, sound card
 underruns).
 
+**"A buffer underrun or overrun occurred" on an output.** This is a hardware xrun, separate
+from an empty network jitter queue. Direct ALSA outputs use 40 ms periods and an 80 ms hardware
+ring; `--latency` changes the application queue, not that ring. The receiver counts startup
+xruns too. Check per-output `card` versus `dropouts`/`skips` in `--json`, and inspect the actual
+ALSA parameters under `/proc/asound/card*/pcm*p/sub0/hw_params`. Audio callbacks use bounded
+queues and request real-time scheduling through RTKit. A scheduling failure is reported, not
+hidden; check that RTKit/system D-Bus is available before assuming real-time scheduling worked.
+
 **The sound cuts out regularly, every minute or so.** Something may keep restarting the sound
 server on the sending desktop. Check with
 `journalctl --user -u pipewire --since "-10min" | grep -E "Started|Stopped"`. One cause seen on

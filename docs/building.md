@@ -1,7 +1,7 @@
 # Building
 
 ```bash
-sudo apt install libpulse-dev libasound2-dev pkg-config cmake   # Debian/Ubuntu build dependencies
+sudo apt install libpulse-dev libasound2-dev libdbus-1-dev pkg-config cmake   # Debian/Ubuntu build dependencies
 cargo build --release                                     # this machine: target/release/rtp-audio
 cargo test
 ```
@@ -16,7 +16,9 @@ cargo build --release --target x86_64-pc-windows-gnu
 ## Runtime requirements and limitations
 
 - The Linux binary links `libpulse.so.0` (`libpulse0` / `pulseaudio-libs`) and `libasound.so.2`
-  (`libasound2` / `alsa-lib`) dynamically; both ship with nearly every desktop. It runs no other
+  (`libasound2` / `alsa-lib`), plus `libdbus-1.so.3` (`libdbus-1-3` / `dbus-libs`) dynamically.
+  D-Bus lets direct audio threads request real-time scheduling through RTKit; if promotion is
+  unavailable, playback continues and reports the failure. These libraries ship with most desktops. It runs no other
   programs: no `pactl`, `parec` or shell scripts.
 - Opus (for the browser mode) is compiled into the binary from source, which is why building
   needs `cmake`; running needs no Opus library.

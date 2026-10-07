@@ -174,7 +174,7 @@ impl Unpacker {
 }
 
 /// RTP packets on a UDP port: plain, Opus or encrypted, from one sender or a multicast group.
-pub(super) fn receive_udp(options: &Options, card: &str, jitter: &Buffers, peak: &AtomicU32, monitor: &mut Monitor) -> Result<(), Box<dyn Error>> {
+pub(super) fn receive_udp(options: &Options, card: &str, jitter: &mut Buffers, peak: &AtomicU32, monitor: &mut Monitor) -> Result<(), Box<dyn Error>> {
     let socket = bind(options.port, options.group)?;
     println!(
         "Listening on UDP port {} ({} Hz, {} ch, {} ms buffer); {card}",

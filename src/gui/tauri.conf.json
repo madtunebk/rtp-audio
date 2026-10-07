@@ -13,10 +13,9 @@
         "title": "RTP Audio Studio",
         "width": 1400,
         "height": 750,
-        "resizable": true,
-        "minWidth": 900,
-        "minHeight": 620,
-        "fullscreen": false
+        "resizable": false,
+        "fullscreen": false,
+        "maximizable": false
       }
     ],
     "security": {

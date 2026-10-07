@@ -16,7 +16,7 @@ pub(super) const RECONNECT_EVERY: Duration = Duration::from_secs(2);
 
 /// The sender's WebSocket stream (`rtp-audio send --web`): Opus over TCP, so nothing is lost
 /// and it goes through an SSH tunnel or a proxy; it reconnects by itself when the sender restarts.
-pub(super) fn receive_websocket(url: &str, options: &Options, card: &str, jitter: &Buffers, peak: &AtomicU32, monitor: &mut Monitor) -> Result<(), Box<dyn Error>> {
+pub(super) fn receive_websocket(url: &str, options: &Options, card: &str, jitter: &mut Buffers, peak: &AtomicU32, monitor: &mut Monitor) -> Result<(), Box<dyn Error>> {
     let target = WsTarget::parse(url)?;
     println!("Receiving from {url} over TCP ({} ms buffer); {card}", options.latency_ms);
     print_volume_and_quit(options);
@@ -46,7 +46,7 @@ pub(super) fn receive_websocket(url: &str, options: &Options, card: &str, jitter
 }
 
 /// One connection to the sender's stream, until it ends.
-pub(super) fn websocket_session(target: &WsTarget, options: &Options, jitter: &Buffers, peak: &AtomicU32, monitor: &mut Monitor, sequence: &mut u16) -> Result<(), Box<dyn Error>> {
+pub(super) fn websocket_session(target: &WsTarget, options: &Options, jitter: &mut Buffers, peak: &AtomicU32, monitor: &mut Monitor, sequence: &mut u16) -> Result<(), Box<dyn Error>> {
     let stream = TcpStream::connect((target.host.as_str(), target.port))?;
     // Frames are small and every 20 ms: send them at once rather than gathering them.
     stream.set_nodelay(true)?;

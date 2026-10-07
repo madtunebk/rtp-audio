@@ -11,10 +11,10 @@ pub use outputs::list_devices;
 
 use std::error::Error;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, Mutex};
 
-use jitter::{Jitter, Stats};
+use jitter::{Feed, Stats};
 use outputs::{Output, device_name, open_output, pick_devices, short_name};
 use status::Monitor;
 use udp::receive_udp;
@@ -46,29 +46,30 @@ pub struct Options {
 
 /// The jitter buffers of all the outputs: every frame goes into each (and into the spectrum, with
 /// --json).
-struct Buffers(Vec<(String, Arc<Mutex<Jitter>>)>, Option<Mutex<spectrum::Spectrum>>);
+struct Buffers(Vec<(String, Feed)>, Option<spectrum::Tap>);
 
 impl Buffers {
-    fn push(&self, sequence: u16, pcm: &[u8], channels: usize) {
-        if let Some(spectrum) = &self.1 {
-            spectrum.lock().unwrap().feed(pcm, channels);
+    fn push(&mut self, sequence: u16, pcm: &[u8], channels: usize) {
+        // Feed every output first; visualization is optional and never backpressures audio.
+        for (_, jitter) in &mut self.0 {
+            jitter.push(sequence, pcm, channels);
         }
-        for (_, jitter) in &self.0 {
-            jitter.lock().unwrap().push(sequence, pcm, channels);
+        if let Some(spectrum) = &self.1 {
+            spectrum.feed(pcm, channels);
         }
     }
 
     /// Packets lost on the way that the jitter buffers saw no gap for (concealed by Opus).
     fn count_lost(&self, packets: u16) {
         for (_, jitter) in &self.0 {
-            jitter.lock().unwrap().stats.lost += u64::from(packets);
+            jitter.count_lost(packets);
         }
     }
 
     /// A new sender: drop what's buffered from the last one.
-    fn restart(&self) {
-        for (_, jitter) in &self.0 {
-            jitter.lock().unwrap().restart();
+    fn restart(&mut self) {
+        for (_, jitter) in &mut self.0 {
+            jitter.restart();
         }
     }
 
@@ -79,9 +80,9 @@ impl Buffers {
             .0
             .iter()
             .map(|(_, jitter)| {
-                let jitter = jitter.lock().unwrap();
-                buffered = buffered.min(jitter.buffered());
-                jitter.stats
+                let (stats, waiting) = jitter.metrics.state();
+                buffered = buffered.min(waiting);
+                stats
             })
             .collect();
         (stats, if buffered == usize::MAX { 0 } else { buffered })
@@ -108,9 +109,9 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     for (device, tuning) in devices {
         // A delayed output keeps that much more sound buffered, so it plays that much later.
         let delayed = target + (u64::from(options.rate) * u64::from(tuning.delay_ms) / 1000) as usize;
-        let jitter = Arc::new(Mutex::new(Jitter::new(delayed)));
+        let (feed, jitter, errors) = jitter::channel(delayed);
         let volume = options.volume * tuning.volume;
-        let out = Output { jitter: Arc::clone(&jitter), peak: Arc::clone(&peak), volume, input_rate: options.rate };
+        let out = Output { jitter, errors, peak: Arc::clone(&peak), volume, input_rate: options.rate };
         match open_output(&device, out) {
             Ok((stream, card)) => {
                 let mut delay = if tuning.delay_ms > 0 { format!(" +{} ms", tuning.delay_ms) } else { String::new() };
@@ -118,7 +119,7 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
                     delay += &format!(" {:.0}%", tuning.volume * 100.0);
                 }
                 cards.push((format!("{}{delay}", device_name(&device)), format!("{card}{delay}")));
-                buffers.push((short_name(&device_name(&device)), jitter));
+                buffers.push((short_name(&device_name(&device)), feed));
                 ids.push(outputs::device_id(&device));
                 streams.push(stream);
             }
@@ -138,11 +139,17 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
         [(_, details)] => format!("sound card: {details}"),
         _ => format!("playing on {} outputs: {}", cards.len(), cards.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", ")),
     };
-    let jitter = Buffers(buffers, options.json.then(|| Mutex::new(spectrum::Spectrum::new(options.rate))));
+    // Two outputs with the same name (two monitors of one model) are told apart by their IDs.
+    for i in 0..buffers.len() {
+        if buffers.iter().filter(|(label, _)| *label == buffers[i].0).count() > 1 {
+            buffers[i].0 = format!("{} [{}]", buffers[i].0, ids[i]);
+        }
+    }
+    let mut jitter = Buffers(buffers, options.json.then(|| spectrum::Tap::new(options.rate)));
     let mut monitor = Monitor::new(options.rate, options.json.then_some(ids));
     match &options.url {
-        Some(url) => receive_websocket(url, &options, &card, &jitter, &peak, &mut monitor),
-        None => receive_udp(&options, &card, &jitter, &peak, &mut monitor),
+        Some(url) => receive_websocket(url, &options, &card, &mut jitter, &peak, &mut monitor),
+        None => receive_udp(&options, &card, &mut jitter, &peak, &mut monitor),
     }
 }
 

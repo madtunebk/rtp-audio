@@ -2,14 +2,12 @@
 
 use std::error::Error;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
-use super::jitter::{Jitter, Player};
-use super::status::STATUS_WIDTH;
+use super::jitter::{Playback, Player};
 
 pub(super) fn device_name(device: &cpal::Device) -> String {
     device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "(unnamed)".into())
@@ -283,11 +281,10 @@ fn suffix<'a>(text: &'a str, unit: &str, mark: char) -> Option<(&'a str, &'a str
     (!number.is_empty() && number.chars().all(|c| c.is_ascii_digit())).then(|| (rest.trim_end(), number))
 }
 
-/// How much a card opened directly (ALSA hw:) is asked for at a time: 20 ms. Left to itself,
-/// ALSA can pick seconds, which the jitter buffer can't keep level with; 10 ms was too tight for a
-/// card playing next to other outputs. Outputs that go through a sound server (PipeWire,
-/// PulseAudio, the default) keep their own sizes: a short period runs them dry.
-pub(super) const CARD_PERIOD_MS: u32 = 20;
+/// Direct ALSA cards use 40-ms periods (CPAL negotiates two: an 80-ms hardware ring).
+/// This gives desktop scheduling more headroom. Hardware latency is separate from --latency.
+/// Native PulseAudio streams retain 20-ms periods; ALSA sound-server plugins keep their defaults.
+pub(super) const CARD_PERIOD_MS: u32 = 40;
 
 /// The sample formats sound is played in, best first.
 pub(super) const FORMATS: [SampleFormat; 5] = [SampleFormat::F32, SampleFormat::I32, SampleFormat::I16, SampleFormat::F64, SampleFormat::U16];
@@ -324,7 +321,7 @@ pub(super) fn open_output(device: &cpal::Device, out: Output) -> Result<(cpal::S
     let direct = alsa_port(&id).is_some_and(|port| port.plugin == "hw") || id.starts_with("pulseaudio:");
     let buffer_size = match supported.buffer_size() {
         cpal::SupportedBufferSize::Range { min, max } if direct => {
-            cpal::BufferSize::Fixed((supported.sample_rate() * CARD_PERIOD_MS / 1000).clamp(*min, *max))
+            cpal::BufferSize::Fixed((supported.sample_rate() * if id.starts_with("pulseaudio:") { 20 } else { CARD_PERIOD_MS } / 1000).clamp(*min, *max))
         }
         _ => cpal::BufferSize::Default,
     };
@@ -355,12 +352,10 @@ pub(super) fn short_name(name: &str) -> String {
     short.chars().take(24).collect()
 }
 
-/// How long after opening an output its errors are ignored: starting up, not a problem.
-const STARTING: Duration = Duration::from_secs(1);
-
 /// What the sound card callback needs.
 pub(super) struct Output {
-    pub(super) jitter: Arc<Mutex<Jitter>>,
+    pub(super) jitter: Playback,
+    pub(super) errors: rtrb::Producer<cpal::Error>,
     pub(super) peak: Arc<AtomicU32>,
     pub(super) volume: f32,
     pub(super) input_rate: u32,
@@ -372,19 +367,17 @@ where
 {
     let channels = config.channels as usize;
     let mut player = Player::new(out.input_rate, config.sample_rate);
-    let Output { jitter, peak, volume, .. } = out;
-    let errors = Arc::clone(&jitter);
-    let name = device_name(device);
-    let mut shown = false;
-    let opened = Instant::now();
+    let Output { mut jitter, peak, volume, mut errors, .. } = out;
+    let metrics = Arc::clone(&jitter.metrics);
     let stream = device.build_output_stream(
         *config,
         move |data: &mut [T], _| {
-            let mut jitter = jitter.lock().unwrap();
-            player.update_speed(&jitter);
+            jitter.prepare_callback(&player, data.len() / channels);
+            jitter.refill();
+            jitter.update_speed(&mut player);
             let mut loudest = 0.0f32;
             for frame in data.chunks_mut(channels) {
-                let [left, right] = player.next_frame(&mut jitter);
+                let [left, right] = jitter.next_frame(&mut player);
                 // The meter shows what arrives, whatever the volume.
                 loudest = loudest.max(left.abs()).max(right.abs());
                 let (left, right) = ((left * volume).clamp(-1.0, 1.0), (right * volume).clamp(-1.0, 1.0));
@@ -400,20 +393,15 @@ where
             }
             // Positive f32s order like their bits, so fetch_max keeps the loudest.
             peak.fetch_max(loudest.to_bits(), Ordering::Relaxed);
+            jitter.publish();
         },
-        // Counted with the other problems (status line, reports); only the first is spelled out,
-        // on a line of its own, so a card that keeps hiccuping doesn't flood the terminal. A card
-        // opened directly often runs dry once while starting, before the first sound reaches it:
-        // harmless, so the first moments aren't reported.
+        // CPAL invokes this before ALSA recovery: no mutex, formatting or pipe I/O here.
         move |err| {
-            if opened.elapsed() < STARTING {
-                return;
+            if err.kind() == cpal::ErrorKind::Xrun {
+                metrics.card.fetch_add(1, Ordering::Relaxed);
             }
-            errors.lock().unwrap().stats.card += 1;
-            if !shown {
-                shown = true;
-                eprintln!("\r{:width$}\r{name}: {err} (further ones are counted as problems)", "", width = STATUS_WIDTH);
-            }
+            // Startup errors are counted too. Telemetry handles these bounded diagnostics.
+            let _ = errors.push(err);
         },
         None,
     )?;

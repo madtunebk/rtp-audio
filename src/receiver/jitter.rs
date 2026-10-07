@@ -16,6 +16,7 @@ const MAX_ADJUST: f64 = 0.005;
 
 pub struct Jitter {
     frames: VecDeque<[f32; 2]>,
+    #[cfg(test)]
     next_sequence: Option<u16>,
     playing: bool,
     /// Frames to collect before playing (and to aim for while playing).
@@ -49,17 +50,19 @@ impl Jitter {
 
     pub fn new(target: usize) -> Self {
         Self {
-            frames: VecDeque::with_capacity(target * 4),
+            frames: VecDeque::with_capacity(target.max(2) * 4),
+            #[cfg(test)]
             next_sequence: None,
             playing: false,
-            target,
-            max: target * 4,
+            target: target.max(2),
+            max: target.max(2) * 4,
             last_push: None,
             stats: Stats::default(),
         }
     }
 
     /// Add one packet of big-endian i16 samples with `channels` channels (1 or 2).
+    #[cfg(test)]
     pub fn push(&mut self, sequence: u16, payload: &[u8], channels: usize) {
         self.last_push = Some(Instant::now());
         let sample = |b: &[u8]| f32::from(i16::from_be_bytes([b[0], b[1]])) / 32768.0;
@@ -74,7 +77,9 @@ impl Jitter {
                 gap if gap <= MAX_GAP => {
                     self.stats.lost += u64::from(gap);
                     let lost = gap as usize * payload.len() / (2 * channels);
-                    self.frames.extend(std::iter::repeat_n([0.0; 2], lost));
+                    for _ in 0..lost {
+                        self.append([0.0; 2]);
+                    }
                 }
                 gap if gap >= 0x8000 => {
                     self.stats.late += 1;
@@ -84,7 +89,9 @@ impl Jitter {
             }
         }
         self.next_sequence = Some(sequence.wrapping_add(1));
-        self.frames.extend(frames);
+        for frame in frames {
+            self.append(frame);
+        }
         if self.frames.len() > self.max {
             let excess = self.frames.len() - self.target;
             self.frames.drain(..excess);
@@ -92,10 +99,23 @@ impl Jitter {
         }
     }
 
+    // The audio callback must never grow its allocation, even on a network burst.
+    fn append(&mut self, frame: [f32; 2]) {
+        if self.frames.len() == self.max {
+            let excess = self.frames.len().saturating_sub(self.target);
+            self.frames.drain(..excess.max(1));
+            self.stats.trimmed += 1;
+        }
+        self.frames.push_back(frame);
+    }
+
     /// Start over for a new sender: drop the buffered sound and forget the sequence numbers.
     pub fn restart(&mut self) {
         self.reset();
-        self.next_sequence = None;
+        #[cfg(test)]
+        {
+            self.next_sequence = None;
+        }
     }
 
     fn reset(&mut self) {
@@ -157,6 +177,152 @@ impl Player {
         let t = self.position as f32;
         self.position += self.base_step * (1.0 + self.adjust);
         [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+    }
+}
+
+/// Shared counters only: neither network nor telemetry can lock the output callback.
+#[derive(Default)]
+pub(super) struct Metrics {
+    pub(super) card: std::sync::atomic::AtomicU64,
+    generation: std::sync::atomic::AtomicU64,
+    lost: std::sync::atomic::AtomicU64,
+    late: std::sync::atomic::AtomicU64,
+    overruns: std::sync::atomic::AtomicU64,
+    underruns: std::sync::atomic::AtomicU64,
+    trimmed: std::sync::atomic::AtomicU64,
+    buffered: std::sync::atomic::AtomicUsize,
+}
+impl Metrics {
+    pub(super) fn state(&self) -> (Stats, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            Stats {
+                card: self.card.load(Relaxed),
+                lost: self.lost.load(Relaxed),
+                late: self.late.load(Relaxed),
+                underruns: self.underruns.load(Relaxed),
+                trimmed: self.trimmed.load(Relaxed) + self.overruns.load(Relaxed),
+            },
+            self.buffered.load(Relaxed),
+        )
+    }
+}
+#[derive(Clone, Copy)]
+struct Frame {
+    samples: [f32; 2],
+    generation: u64,
+}
+
+/// Network-owned producer. Full queues drop the new packet (counted), never block.
+pub(super) struct Feed {
+    producer: rtrb::Producer<Frame>,
+    pub(super) metrics: std::sync::Arc<Metrics>,
+    pub(super) errors: rtrb::Consumer<cpal::Error>,
+    sequence: Option<u16>,
+    generation: u64,
+}
+/// Callback-owned jitter and ring consumer. No mutexes, logging or allocations.
+pub(super) struct Playback {
+    consumer: rtrb::Consumer<Frame>,
+    jitter: Jitter,
+    generation: u64,
+    pub(super) metrics: std::sync::Arc<Metrics>,
+}
+pub(super) fn channel(target: usize) -> (Feed, Playback, rtrb::Producer<cpal::Error>) {
+    let target = target.max(2);
+    let (producer, consumer) = rtrb::RingBuffer::new(target * 4);
+    let (errors, read_errors) = rtrb::RingBuffer::new(16);
+    let metrics = std::sync::Arc::new(Metrics::default());
+    (
+        Feed { producer, metrics: metrics.clone(), errors: read_errors, sequence: None, generation: 0 },
+        Playback { consumer, jitter: Jitter::new(target), generation: 0, metrics },
+        errors,
+    )
+}
+impl Feed {
+    pub(super) fn push(&mut self, sequence: u16, pcm: &[u8], channels: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let count = pcm.len() / (2 * channels);
+        let mut gap = 0;
+        if let Some(expected) = self.sequence {
+            match sequence.wrapping_sub(expected) {
+                0 => {}
+                n if n <= MAX_GAP => {
+                    gap = usize::from(n);
+                    self.metrics.lost.fetch_add(u64::from(n), Relaxed);
+                }
+                n if n >= 0x8000 => {
+                    self.metrics.late.fetch_add(1, Relaxed);
+                    return;
+                }
+                _ => self.restart(),
+            }
+        }
+        self.sequence = Some(sequence.wrapping_add(1));
+        // Do not partially enqueue a packet: that would warp the clock/sample count.
+        if self.producer.slots() < count.saturating_mul(gap + 1) {
+            self.metrics.overruns.fetch_add(1, Relaxed);
+            return;
+        }
+        for _ in 0..count * gap {
+            let _ = self.producer.push(Frame { samples: [0.; 2], generation: self.generation });
+        }
+        for bytes in pcm.chunks_exact(2 * channels) {
+            let left = f32::from(i16::from_be_bytes([bytes[0], bytes[1]])) / 32768.;
+            let right = if channels == 2 { f32::from(i16::from_be_bytes([bytes[2], bytes[3]])) / 32768. } else { left };
+            let _ = self.producer.push(Frame { samples: [left, right], generation: self.generation });
+        }
+    }
+    pub(super) fn restart(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.sequence = None;
+        self.metrics.generation.store(self.generation, std::sync::atomic::Ordering::Release);
+    }
+    pub(super) fn count_lost(&self, n: u16) {
+        self.metrics.lost.fetch_add(u64::from(n), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+impl Playback {
+    pub(super) fn refill(&mut self) {
+        // Snapshot once: concurrent arrivals cannot make this callback drain forever.
+        let generation = self.metrics.generation.load(std::sync::atomic::Ordering::Acquire);
+        if generation != self.generation {
+            self.jitter.restart();
+            self.generation = generation;
+        }
+        let count = self.consumer.slots().min(8192);
+        let mut received = false;
+        for _ in 0..count {
+            if let Ok(frame) = self.consumer.pop() {
+                if frame.generation != self.generation {
+                    continue;
+                }
+                self.jitter.append(frame.samples);
+                received = true;
+            }
+        }
+        if received {
+            self.jitter.last_push = Some(Instant::now());
+        }
+    }
+
+    pub(super) fn prepare_callback(&mut self, player: &Player, frames: usize) {
+        // A short --latency must still cover one hardware callback plus interpolation.
+        // Keep the preallocated bound even if a backend unexpectedly asks for a huge block.
+        let needed = (frames as f64 * player.base_step * (1.0 + MAX_ADJUST)).ceil() as usize + 2;
+        self.jitter.target = self.jitter.target.max(needed.min(self.jitter.max - 1));
+    }
+    pub(super) fn update_speed(&self, player: &mut Player) {
+        player.update_speed(&self.jitter);
+    }
+    pub(super) fn next_frame(&mut self, player: &mut Player) -> [f32; 2] {
+        player.next_frame(&mut self.jitter)
+    }
+    pub(super) fn publish(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.metrics.underruns.store(self.jitter.stats.underruns, Relaxed);
+        self.metrics.trimmed.store(self.jitter.stats.trimmed, Relaxed);
+        self.metrics.buffered.store(self.jitter.buffered() + self.consumer.slots(), Relaxed);
     }
 }
 
@@ -227,5 +393,90 @@ mod tests {
             player.next_frame(&mut jitter);
         }
         assert_eq!(jitter.stats.underruns, 0);
+    }
+    #[test]
+    fn spsc_plays_and_counts_missing_and_late_packets() {
+        let (mut feed, mut output, _errors) = super::channel(100);
+        feed.push(10, &packet(16384, 40), 2);
+        feed.push(12, &packet(16384, 40), 2);
+        feed.push(11, &packet(16384, 40), 2);
+        output.refill();
+        let mut player = Player::new(48000, 48000);
+        // Startup trims 120 frames to the target; the first 20 are from packet 10.
+        assert_eq!(output.next_frame(&mut player), [0.5; 2]);
+        output.publish();
+        let (stats, _) = feed.metrics.state();
+        assert_eq!((stats.lost, stats.late), (1, 1));
+    }
+
+    #[test]
+    fn full_spsc_queue_never_waits_and_does_not_partially_insert() {
+        let (mut feed, mut output, _errors) = super::channel(4);
+        feed.push(0, &packet(100, 16), 2);
+        feed.push(1, &packet(200, 2), 2);
+        assert_eq!(feed.producer.slots(), 0);
+        assert_eq!(feed.metrics.state().0.trimmed, 1);
+        let capacity = output.jitter.frames.capacity();
+        output.refill();
+        assert_eq!(output.jitter.frames.capacity(), capacity);
+        assert_eq!(output.jitter.frames.len(), 16);
+        // Larger later batches also cannot reallocate the callback-owned queue.
+        feed.push(2, &packet(300, 16), 2);
+        output.refill();
+        assert_eq!(output.jitter.frames.capacity(), capacity);
+        assert!(output.jitter.frames.len() <= 16);
+    }
+
+    #[test]
+    fn stalled_producer_does_not_hold_the_callback() {
+        let (feed, mut output, _errors) = super::channel(2880);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            let _feed = feed;
+            ready_tx.send(()).unwrap();
+            done_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
+        output.refill();
+        let mut player = Player::new(48000, 48000);
+        for _ in 0..1920 {
+            assert_eq!(output.next_frame(&mut player), [0.; 2]);
+        }
+        output.publish();
+        // No timing threshold: completion happens while producer is still blocked.
+        done_tx.send(()).unwrap();
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn restart_discards_pending_old_sender_without_waiting_for_new_audio() {
+        let (mut feed, mut output, _errors) = super::channel(4);
+        feed.push(0, &packet(16384, 4), 2);
+        output.refill();
+        let mut player = Player::new(48000, 48000);
+        assert_eq!(output.next_frame(&mut player), [0.5; 2]);
+        feed.push(1, &packet(16384, 4), 2);
+        feed.restart();
+        output.refill();
+        assert_eq!(output.next_frame(&mut player), [0.; 2]);
+        feed.push(0, &packet(-16384, 4), 1);
+        output.refill();
+        assert_eq!(output.next_frame(&mut player), [-0.5; 2]);
+    }
+
+    #[test]
+    fn short_latency_covers_a_larger_hardware_period() {
+        let (mut feed, mut output, _errors) = super::channel(960); // 20 ms
+        let mut player = Player::new(48000, 48000);
+        for n in 0..3 {
+            feed.push(n, &packet(100, 960), 2);
+        }
+        output.prepare_callback(&player, 1920); // 40-ms hardware period
+        output.refill();
+        for _ in 0..1920 {
+            assert!(output.next_frame(&mut player)[0] > 0.);
+        }
+        assert_eq!(output.jitter.stats.underruns, 0);
     }
 }

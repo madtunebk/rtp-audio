@@ -26,7 +26,18 @@ The receiver plays one sender at a time, by address and SSRC; another is taken o
 second of quiet, with the buffer and the decoder started afresh. It plays L16 (payload types
 10, 11 and 96–127) and Opus, and ignores other codecs. With several outputs, each has its own
 jitter buffer and resampler fed with the same sound; cards opened directly (ALSA `hw:`) are asked
-for 20 ms periods.
+for 40 ms periods (an 80 ms hardware ring with CPAL), independently of `--latency`.
+Native PulseAudio outputs keep 20 ms periods. A preallocated SPSC queue connects the network
+producer to each callback; the callback owns its jitter buffer and never waits for the network
+or the visualizer. Full input queues drop new packets and count a skip; the callback also trims
+old buffered sound on bursts. Very short jitter targets are raised to cover a hardware callback
+plus interpolation. This can increase effective latency; output synchronization must include
+the hardware latency too.
+
+FFT runs on a separate worker with a two-packet queue. Status/JSON output runs on another
+worker with a two-snapshot queue. Slow analysis or GUI/log consumers drop visual updates
+without holding up reception or playback. All hardware xruns, including startup ones, are
+counted; error text is emitted outside the audio callback.
 
 **Encryption.** Each sender session starts with a random SSRC, sequence, timestamp and 62-bit
 packet counter, and SSRC + counter is the ChaCha20-Poly1305 nonce, so sessions sharing a key
