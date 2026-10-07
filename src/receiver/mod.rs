@@ -96,6 +96,9 @@ impl Buffers {
     }
 }
 
+/// How much later --sync can make an output play than its own buffer: room for that is made up front.
+const SYNC_ROOM_MS: u64 = 500;
+
 /// Receive RTP audio on a UDP port, or the sender's WebSocket stream, and play it on a sound
 /// card until killed.
 pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
@@ -111,7 +114,9 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     for (device, tuning) in devices {
         // A delayed output keeps that much more sound buffered, so it plays that much later.
         let delayed = target + (u64::from(options.rate) * u64::from(tuning.delay_ms) / 1000) as usize;
-        let (feed, jitter, errors) = jitter::channel(delayed);
+        // --sync may make an output wait for a slower one (a Bluetooth speaker: about 240 ms).
+        let room = if options.sync { (u64::from(options.rate) * SYNC_ROOM_MS / 1000) as usize } else { 0 };
+        let (feed, jitter, errors) = jitter::channel(delayed, room);
         let volume = options.volume * tuning.volume;
         let out = Output { jitter, errors, peak: Arc::clone(&peak), volume, input_rate: options.rate };
         match open_output(&device, out) {

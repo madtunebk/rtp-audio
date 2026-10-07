@@ -23,6 +23,8 @@ pub struct Jitter {
     target: usize,
     /// Older frames are dropped beyond this: a stall must not leave the sound lagging behind.
     max: usize,
+    /// Frames room was made for up front (the callback never allocates): the most max can be.
+    capacity: usize,
     last_push: Option<Instant>,
     pub stats: Stats,
 }
@@ -48,14 +50,22 @@ impl Jitter {
         self.frames.len()
     }
 
+    #[cfg(test)]
     pub fn new(target: usize) -> Self {
+        Self::with_room(target, 0)
+    }
+
+    /// A buffer whose target may later grow by up to `room` frames (--sync) without dropping sound.
+    pub fn with_room(target: usize, room: usize) -> Self {
+        let capacity = (target.max(2) + room) * 4;
         Self {
-            frames: VecDeque::with_capacity(target.max(2) * 4),
+            frames: VecDeque::with_capacity(capacity),
             #[cfg(test)]
             next_sequence: None,
             playing: false,
             target: target.max(2),
             max: target.max(2) * 4,
+            capacity,
             last_push: None,
             stats: Stats::default(),
         }
@@ -241,14 +251,16 @@ pub(super) struct Playback {
     generation: u64,
     pub(super) metrics: std::sync::Arc<Metrics>,
 }
-pub(super) fn channel(target: usize) -> (Feed, Playback, rtrb::Producer<cpal::Error>) {
+/// An output's queue and buffer, aiming for `target` frames, with `room` frames more that --sync may
+/// add.
+pub(super) fn channel(target: usize, room: usize) -> (Feed, Playback, rtrb::Producer<cpal::Error>) {
     let target = target.max(2);
-    let (producer, consumer) = rtrb::RingBuffer::new(target * 4);
+    let (producer, consumer) = rtrb::RingBuffer::new((target + room) * 4);
     let (errors, read_errors) = rtrb::RingBuffer::new(16);
     let metrics = std::sync::Arc::new(Metrics::default());
     (
         Feed { producer, metrics: metrics.clone(), errors: read_errors, sequence: None, generation: 0 },
-        Playback { consumer, jitter: Jitter::new(target), base: target, generation: 0, metrics },
+        Playback { consumer, jitter: Jitter::with_room(target, room), base: target, generation: 0, metrics },
         errors,
     )
 }
@@ -325,7 +337,11 @@ impl Playback {
         let needed = (frames as f64 * player.base_step * (1.0 + MAX_ADJUST)).ceil() as usize + 2;
         // --sync's share comes in through the speed adjustment, or at once before playing.
         let wanted = self.base + self.metrics.sync_frames.load(std::sync::atomic::Ordering::Relaxed);
-        self.jitter.target = wanted.max(needed).min(self.jitter.max - 1);
+        let target = wanted.max(needed).min(self.jitter.capacity - 1);
+        self.jitter.target = target;
+        // Bursts are trimmed beyond 4× the target, as long as the room made up front allows: a
+        // target raised by --sync must not sit at that limit, or every packet would be trimmed.
+        self.jitter.max = (target * 4).clamp(target + 1, self.jitter.capacity);
     }
     pub(super) fn update_speed(&self, player: &mut Player) {
         player.update_speed(&self.jitter);
@@ -411,7 +427,7 @@ mod tests {
     }
     #[test]
     fn spsc_plays_and_counts_missing_and_late_packets() {
-        let (mut feed, mut output, _errors) = super::channel(100);
+        let (mut feed, mut output, _errors) = super::channel(100, 0);
         feed.push(10, &packet(16384, 40), 2);
         feed.push(12, &packet(16384, 40), 2);
         feed.push(11, &packet(16384, 40), 2);
@@ -426,7 +442,7 @@ mod tests {
 
     #[test]
     fn full_spsc_queue_never_waits_and_does_not_partially_insert() {
-        let (mut feed, mut output, _errors) = super::channel(4);
+        let (mut feed, mut output, _errors) = super::channel(4, 0);
         feed.push(0, &packet(100, 16), 2);
         feed.push(1, &packet(200, 2), 2);
         assert_eq!(feed.producer.slots(), 0);
@@ -444,7 +460,7 @@ mod tests {
 
     #[test]
     fn stalled_producer_does_not_hold_the_callback() {
-        let (feed, mut output, _errors) = super::channel(2880);
+        let (feed, mut output, _errors) = super::channel(2880, 0);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let producer = std::thread::spawn(move || {
@@ -466,7 +482,7 @@ mod tests {
 
     #[test]
     fn restart_discards_pending_old_sender_without_waiting_for_new_audio() {
-        let (mut feed, mut output, _errors) = super::channel(4);
+        let (mut feed, mut output, _errors) = super::channel(4, 0);
         feed.push(0, &packet(16384, 4), 2);
         output.refill();
         let mut player = Player::new(48000, 48000);
@@ -482,7 +498,7 @@ mod tests {
 
     #[test]
     fn sync_adds_to_the_target_and_takes_it_back() {
-        let (_feed, mut output, _errors) = super::channel(2880);
+        let (_feed, mut output, _errors) = super::channel(2880, 0);
         let player = Player::new(48000, 48000);
         output.metrics.sync_frames.store(960, std::sync::atomic::Ordering::Relaxed);
         output.prepare_callback(&player, 480);
@@ -493,8 +509,33 @@ mod tests {
     }
 
     #[test]
+    fn a_large_sync_has_room_and_is_not_trimmed() {
+        // 60 ms buffer, then --sync asks for 200 ms more (a Bluetooth speaker next to HDMI).
+        let (mut feed, mut output, _errors) = super::channel(2880, 48_000 / 2);
+        let mut player = Player::new(48000, 48000);
+        output.metrics.sync_frames.store(9600, std::sync::atomic::Ordering::Relaxed);
+        output.prepare_callback(&player, 960);
+        assert_eq!(output.jitter.target, 2880 + 9600);
+        // 300 ms arrive at once: kept (below 4× the target), nothing trimmed.
+        for n in 0..15 {
+            feed.push(n, &packet(100, 960), 2);
+        }
+        output.refill();
+        player.next_frame(&mut output.jitter);
+        assert_eq!(output.jitter.stats.trimmed, 0);
+    }
+
+    #[test]
+    fn without_room_the_limits_are_as_before() {
+        let (_feed, mut output, _errors) = super::channel(2880, 0);
+        let player = Player::new(48000, 48000);
+        output.prepare_callback(&player, 960);
+        assert_eq!((output.jitter.target, output.jitter.max), (2880, 2880 * 4));
+    }
+
+    #[test]
     fn short_latency_covers_a_larger_hardware_period() {
-        let (mut feed, mut output, _errors) = super::channel(960); // 20 ms
+        let (mut feed, mut output, _errors) = super::channel(960, 0); // 20 ms
         let mut player = Player::new(48000, 48000);
         for n in 0..3 {
             feed.push(n, &packet(100, 960), 2);

@@ -429,7 +429,7 @@ mod tests {
         let outputs: Vec<_> = [40_000u64, 80_000, 45_000, 0]
             .iter()
             .map(|&latency_us| {
-                let (feed, _, _) = crate::receiver::jitter::channel(2880);
+                let (feed, _, _) = crate::receiver::jitter::channel(2880, 0);
                 feed.metrics.device_latency_us.store(latency_us, Ordering::Relaxed);
                 (String::new(), feed)
             })
