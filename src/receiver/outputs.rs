@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
@@ -307,6 +308,9 @@ pub(super) fn short_name(name: &str) -> String {
     short.chars().take(24).collect()
 }
 
+/// How long after opening an output its errors are ignored: starting up, not a problem.
+const STARTING: Duration = Duration::from_secs(1);
+
 /// What the sound card callback needs.
 pub(super) struct Output {
     pub(super) jitter: Arc<Mutex<Jitter>>,
@@ -325,6 +329,7 @@ where
     let errors = Arc::clone(&jitter);
     let name = device_name(device);
     let mut shown = false;
+    let opened = Instant::now();
     let stream = device.build_output_stream(
         *config,
         move |data: &mut [T], _| {
@@ -350,8 +355,13 @@ where
             peak.fetch_max(loudest.to_bits(), Ordering::Relaxed);
         },
         // Counted with the other problems (status line, reports); only the first is spelled out,
-        // on a line of its own, so a card that keeps hiccuping doesn't flood the terminal.
+        // on a line of its own, so a card that keeps hiccuping doesn't flood the terminal. A card
+        // opened directly often runs dry once while starting, before the first sound reaches it:
+        // harmless, so the first moments aren't reported.
         move |err| {
+            if opened.elapsed() < STARTING {
+                return;
+            }
             errors.lock().unwrap().stats.card += 1;
             if !shown {
                 shown = true;
