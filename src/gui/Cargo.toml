@@ -1,14 +1,17 @@
 [package]
-name = "rtp-audio-studio"
-version = "0.1.0"
+name = "rtp-audio-gui"
+version = "0.4.0"
 edition = "2024"
 
-# The window of `rtp-audio --gui`: built into rtp-audio with `--features gui`.
-[lib]
-name = "rtp_audio_studio"
-path = "lib.rs"
+# The window of `rtp-audio --gui`: a program of its own, so rtp-audio itself needs no WebKit.
+# rtp-audio carries it (built with --features embed-gui) and starts it only for --gui.
+[[bin]]
+name = "rtp-audio-gui"
+path = "main.rs"
 
 [features]
+# The page embedded in the program (not served by `npm run dev`).
+default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]

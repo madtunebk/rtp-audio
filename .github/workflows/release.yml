@@ -29,6 +29,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary: rtp-audio.exe
+            window: rtp-audio-gui.exe
           # Apple Silicon Macs: the receiver (capturing is Linux only).
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -41,17 +42,31 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Install build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libpulse-dev libasound2-dev libdbus-1-dev pkg-config cmake
+          sudo apt-get install -y --no-install-recommends libpulse-dev libasound2-dev libdbus-1-dev pkg-config cmake \
+            libwebkit2gtk-4.1-dev libxdo-dev libssl-dev librsvg2-dev
 
       - name: Test
         run: cargo test --locked
 
+      # The window (`rtp-audio --gui`) is a program of its own, carried inside rtp-audio: rtp-audio
+      # never links WebKit, only the window does, and it starts only for --gui.
+      - name: Build the window
+        shell: bash
+        run: |
+          (cd src/gui/web && npm ci && npm run build)
+          cargo build --locked --release --manifest-path src/gui/Cargo.toml
+          echo "RTP_AUDIO_GUI_BIN=$PWD/src/gui/target/release/${{ matrix.window || 'rtp-audio-gui' }}" >> "$GITHUB_ENV"
+
       - name: Build
-        run: cargo build --locked --release
+        run: cargo build --locked --release --features embed-gui
 
       - name: Package
         shell: bash

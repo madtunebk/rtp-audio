@@ -13,11 +13,12 @@ if-addrs = "0.15"
 opus = "0.4"
 socket2 = "0.6"
 tungstenite = "0.30"
-# The window (`rtp-audio --gui`), built with `--features gui` after `npm run build` in src/gui/web.
-rtp-audio-studio = { path = "src/gui", optional = true, features = ["custom-protocol"] }
 
 [features]
-gui = ["dep:rtp-audio-studio"]
+# Carry the window program (src/gui, built first) inside rtp-audio, for `rtp-audio --gui`:
+# RTP_AUDIO_GUI_BIN=src/gui/target/release/rtp-audio-gui cargo build --release --features embed-gui
+# rtp-audio itself never links the window's libraries (WebKit): only that program does.
+embed-gui = []
 
 [profile.release]
 strip = true

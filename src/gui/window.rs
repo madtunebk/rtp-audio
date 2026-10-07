@@ -1,11 +1,10 @@
-//! RTP Audio Studio: a window over the `rtp-audio` command (`rtp-audio --gui`). It lists outputs
-//! and sources with `--json`, runs one receiver or sender at a time, and passes its lines to the
-//! page as events.
+//! A window over the `rtp-audio` command (`rtp-audio --gui`). It lists outputs and sources with
+//! `--json`, runs one receiver or sender at a time, and passes its lines to the page as events.
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -32,24 +31,15 @@ struct Exit {
     code: Option<i32>,
 }
 
-/// The rtp-audio given to `run`: the one the window belongs to.
-static BINARY: OnceLock<PathBuf> = OnceLock::new();
-
-/// The rtp-audio to run: the one that opened this window, else $RTP_AUDIO_BIN, else the one next
-/// to this program, else the one in PATH.
+/// The rtp-audio to run: the one that opened this window ($RTP_AUDIO_BIN), else the one next to
+/// this program; never another one found in PATH, which could be another version.
 fn binary() -> PathBuf {
-    if let Some(path) = BINARY.get() {
-        return path.clone();
-    }
     if let Some(path) = std::env::var_os("RTP_AUDIO_BIN") {
         return path.into();
     }
     let name = if cfg!(windows) { "rtp-audio.exe" } else { "rtp-audio" };
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| name.into())
+    let exe = std::env::current_exe().unwrap_or_default();
+    exe.parent().map_or_else(|| name.into(), |dir| dir.join(name))
 }
 
 fn rtp_audio() -> Command {
@@ -185,12 +175,8 @@ fn interrupt(running: &Running) -> Option<u64> {
     Some(*run)
 }
 
-/// Opens the window; `binary` is the rtp-audio it runs (`rtp-audio --gui` passes itself, so
-/// the window and the commands it runs are always the same version).
-pub fn run(binary: Option<PathBuf>) {
-    if let Some(path) = binary {
-        BINARY.set(path).ok();
-    }
+/// Opens the window.
+pub fn run() {
     let app = tauri::Builder::default()
         .manage(Running::default())
         .invoke_handler(tauri::generate_handler![backend_version, list_outputs, list_sources, start, stop])

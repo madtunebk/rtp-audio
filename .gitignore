@@ -20,3 +20,4 @@
 /src/gui/web/test-results/
 /src/gui/web/*.png
 /src/gui/gen/
+/src/gui/target/

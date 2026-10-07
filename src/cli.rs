@@ -49,7 +49,7 @@ usage:
   rtp-audio version
       print the version (also --version)
   rtp-audio gui
-      open the window (also --gui), when rtp-audio was built with it
+      open the window (also --gui); it needs WebKitGTK on Linux, nothing else does
   rtp-audio send HOST:PORT --stdin [--rate 48000] [--channels 2]
       send raw big-endian 16-bit PCM read from stdin
 

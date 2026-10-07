@@ -1,34 +1,40 @@
 # The window: `rtp-audio --gui`
 
-A Tauri window with a Svelte page, built into rtp-audio with the `gui` feature. It runs the very
-rtp-audio that opened it, so the two are always the same version:
+A Tauri window with a Svelte page, built as a program of its own, `rtp-audio-gui`. rtp-audio never
+links its libraries (WebKitGTK on Linux): it carries the window program (when built with
+`--features embed-gui`), writes it once to `~/.cache/rtp-audio/gui-VERSION-HASH/`, checks that it
+can load (with a clear message naming the package to install when WebKitGTK is missing) and starts
+it with `RTP_AUDIO_BIN` set to its own path. So:
 
-- outputs from `rtp-audio devices --json`, sources from `rtp-audio sources --json`;
+- `rtp-audio find`, `devices`, `send`… run on a server without WebKit;
+- the window runs the very rtp-audio that opened it, never another one found in PATH;
+- outputs come from `rtp-audio devices --json`, sources from `rtp-audio sources --json`;
 - Start runs the command shown under "Command preview" (the receiver with `--json`, whose status
   lines feed the levels, the problems and the spectrum); only `receive` and `send` can be started;
 - Stop sends it Ctrl+C, so a sender switches the sound back; closing the window stops it too;
 - gain and delay per output become `--device 'ID+180ms@70%'`.
 
+The window still needs the system's web view: WebKitGTK 4.1 on Linux
+(`sudo apt install libwebkit2gtk-4.1-0`), WebView2 on Windows (built in), WKWebView on macOS.
+
 ## Build
 
-On Ubuntu, Tauri needs WebKitGTK 4.1 (see https://v2.tauri.app/start/prerequisites/):
+On Ubuntu, building the window needs (see https://v2.tauri.app/start/prerequisites/):
 
 ```bash
 sudo apt install libwebkit2gtk-4.1-dev libxdo-dev libssl-dev librsvg2-dev
 ```
 
-Build the page first (Node 20 or newer), then rtp-audio with the window:
+Build the page (Node 20 or newer), then the window, then rtp-audio carrying it:
 
 ```bash
-cd src/gui/web
-npm ci
-npm run build
-cd ../../..
-cargo build --release --features gui
+(cd src/gui/web && npm ci && npm run build)
+cargo build --release --manifest-path src/gui/Cargo.toml
+RTP_AUDIO_GUI_BIN=$PWD/src/gui/target/release/rtp-audio-gui cargo build --release --features embed-gui
 ./target/release/rtp-audio --gui
 ```
 
-Without `--features gui`, rtp-audio builds as before and needs neither Node nor WebKitGTK.
+Without `embed-gui`, rtp-audio looks for `rtp-audio-gui` next to itself instead.
 
 ## The page
 
