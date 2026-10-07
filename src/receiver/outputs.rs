@@ -13,14 +13,62 @@ pub(super) fn device_name(device: &cpal::Device) -> String {
     device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "(unnamed)".into())
 }
 
+/// The output's ID: cpal's, except a card's hw: port, which is named by where the card sits (its
+/// PCI or USB address) instead of its ALSA name. Two cards of one kind are NVidia and NVidia_1 in
+/// whichever order they came up at boot, so an ID by name can point to the other card after a
+/// restart: alsa:hw:CARD=NVidia,DEV=3 → alsa:hw:BUS=0000:01:00.1,DEV=3.
 pub(super) fn device_id(device: &cpal::Device) -> String {
+    let id = raw_id(device);
+    stable_id(&id).unwrap_or(id)
+}
+
+/// cpal's own ID for the output (still accepted in --device).
+fn raw_id(device: &cpal::Device) -> String {
     device.id().map(|id| id.to_string()).unwrap_or_default()
+}
+
+fn stable_id(id: &str) -> Option<String> {
+    let port = alsa_port(id).filter(|port| port.plugin == "hw" && id.contains("CARD="))?;
+    Some(format!("alsa:hw:BUS={},DEV={}", card_bus(&port.card)?, port.dev))
+}
+
+/// Where a sound card sits: the last part of its device's path in sysfs, 0000:01:00.1 for a PCI
+/// card, 3-2:1.0 for a USB one (its port).
+fn card_bus(card: &str) -> Option<String> {
+    let index = std::fs::read_link(format!("/proc/asound/{card}")).ok()?;
+    let path = std::fs::canonicalize(format!("/sys/class/sound/{}/device", index.display())).ok()?;
+    Some(path.file_name()?.to_string_lossy().into_owned())
+}
+
+/// The name of the card at this address, as card_bus gives it.
+fn card_at(bus: &str) -> Option<String> {
+    std::fs::read_dir("/sys/class/sound").ok()?.flatten().find_map(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let index = name.strip_prefix("card").filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))?;
+        let path = std::fs::canonicalize(entry.path().join("device")).ok()?;
+        (path.file_name()?.to_string_lossy() == bus).then_some(())?;
+        Some(std::fs::read_to_string(format!("/proc/asound/card{index}/id")).ok()?.trim().to_string())
+    })
 }
 
 pub(super) struct Outlet {
     name: String,
     id: String,
+    /// cpal's ID, when `id` is a stable one instead.
+    raw: String,
     device: cpal::Device,
+}
+
+impl Outlet {
+    fn new(device: cpal::Device) -> Self {
+        let raw = raw_id(&device);
+        Outlet { name: device_name(&device), id: stable_id(&raw).unwrap_or_else(|| raw.clone()), raw, device }
+    }
+
+    /// Whether `text` is this output's ID, the stable one or cpal's.
+    fn is(&self, text: &str) -> bool {
+        self.id == text || self.raw == text
+    }
 }
 
 /// The outputs, each real one once. ALSA lists every card port under several names (hw:,
@@ -34,7 +82,7 @@ pub(super) struct Outlet {
 /// monitor sleeps), and a port it isn't using can still be played on directly.
 pub(super) fn outputs() -> Result<Vec<Outlet>, Box<dyn Error>> {
     let outlets = |host: &cpal::Host| -> Result<Vec<Outlet>, Box<dyn Error>> {
-        Ok(host.output_devices()?.map(|device| Outlet { name: device_name(&device), id: device_id(&device), device }).collect())
+        Ok(host.output_devices()?.map(Outlet::new).collect())
     };
     let host = cpal::default_host();
     #[allow(unused_mut)]
@@ -67,7 +115,7 @@ pub(super) fn outputs() -> Result<Vec<Outlet>, Box<dyn Error>> {
 /// up/down-mixers, effects, and bridges to JACK and OSS.
 pub(super) const ALSA_HELPERS: &[&str] = &["lavrate", "samplerate", "speexrate", "speex", "upmix", "vdownmix", "jack", "oss"];
 
-/// An ALSA card port, from an ID like alsa:hw:CARD=NVidia,DEV=3.
+/// An ALSA card port, from an ID like alsa:hw:CARD=NVidia,DEV=3 or alsa:hw:BUS=0000:01:00.1,DEV=3.
 pub(super) struct AlsaPort {
     plugin: String,
     /// The card's name; a card given by number (CARD=1) is looked up, so both spellings match.
@@ -79,7 +127,11 @@ pub(super) fn alsa_port(id: &str) -> Option<AlsaPort> {
     let rest = id.strip_prefix("alsa:")?;
     let (plugin, args) = rest.split_once(':')?;
     let field = |name: &str| args.split(',').find_map(|arg| arg.strip_prefix(name)).map(str::to_string);
-    let mut card = field("CARD=")?;
+    let mut card = match field("CARD=") {
+        Some(card) => card,
+        // A card by its address: the one there now (by its address still, if none is).
+        None => field("BUS=").map(|bus| card_at(&bus).unwrap_or(bus))?,
+    };
     if card.chars().all(|c| c.is_ascii_digit())
         && let Ok(name) = std::fs::read_to_string(format!("/proc/asound/card{card}/id"))
     {
@@ -89,7 +141,7 @@ pub(super) fn alsa_port(id: &str) -> Option<AlsaPort> {
 }
 
 /// `rtp-audio devices`: the sound outputs this computer can play on. With --json, for programs:
-/// [{"name":"HDA NVidia, 2590G5","id":"alsa:hw:CARD=NVidia,DEV=3","default":false,"direct":true}]
+/// [{"name":"HDA NVidia, 2590G5","id":"alsa:hw:BUS=0000:01:00.1,DEV=3","default":false,"direct":true}]
 /// where direct is a card opened directly (not through the sound server).
 pub fn list_devices(json: bool) -> Result<(), Box<dyn Error>> {
     let default = cpal::default_host().default_output_device().map(|d| device_id(&d));
@@ -131,7 +183,7 @@ pub(super) fn pick_device(wanted: Option<&str>) -> Result<cpal::Device, Box<dyn 
     };
     let mut outputs = outputs()?;
     let lower = wanted.to_lowercase();
-    if let Some(i) = outputs.iter().position(|o| o.id == wanted) {
+    if let Some(i) = outputs.iter().position(|o| o.is(wanted)) {
         return Ok(outputs.swap_remove(i).device);
     }
     let named: Vec<usize> = (0..outputs.len()).filter(|&i| outputs[i].name.to_lowercase() == lower).collect();
@@ -183,7 +235,7 @@ pub(super) fn pick_devices(wanted: &[String]) -> Result<Vec<(cpal::Device, Tunin
     // An exact ID, or a name only one output has (a shared name is left to pick_device, which
     // asks for the ID).
     let exact = |text: &str| {
-        outputs.iter().position(|o| o.id == text).or_else(|| {
+        outputs.iter().position(|o| o.is(text)).or_else(|| {
             let mut named = outputs.iter().enumerate().filter(|(_, o)| o.name.eq_ignore_ascii_case(text));
             match (named.next(), named.next()) {
                 (Some((i, _)), None) => Some(i),

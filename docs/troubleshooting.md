@@ -23,7 +23,13 @@ desktop) in the VNC server; GNOME is reached through its own RDP.
 It keeps playing the first, and takes the other over once the first has been quiet for a second.
 
 **"several outputs are called …".** Two outputs share that name (e.g. two HDMI ports to the same
-monitor model): pass the ID the message lists, e.g. `--device alsa:hw:CARD=NVidia,DEV=7`.
+monitor model): pass the ID the message lists, e.g. `--device alsa:hw:BUS=0000:01:00.1,DEV=7`.
+
+**After a restart, sound goes to a port with nothing on it.** With two cards of one kind (two
+NVidia graphics cards), ALSA names them NVidia and NVidia_1 in whichever order they come up, so an
+ID like `alsa:hw:CARD=NVidia_1,DEV=3` can point to the other card after a reboot. `rtp-audio
+devices` names cards by where they sit instead (`alsa:hw:BUS=0000:01:00.1,DEV=3`, the PCI or USB
+address), which doesn't change: use those in `--device` and in saved setups.
 
 **"The requested device is temporarily busy" with an `alsa:hw:…` output.** A card opened directly
 takes one program at a time, and the sound server is probably using it. Pick the default output,
