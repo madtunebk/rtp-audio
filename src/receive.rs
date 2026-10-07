@@ -210,11 +210,23 @@ struct Outlet {
 /// two share a name (two HDMI ports to the same model of monitor), and its other aliases are left
 /// out. Outputs that aren't a card (PipeWire, default) and those of other systems are kept, each
 /// ID once.
+///
+/// On Linux with a sound server, its outputs come first, then the cards' hw: ports opened directly:
+/// the server only shows what a card's profile uses (one HDMI port at a time, none while the
+/// monitor sleeps), and a port it isn't using can still be played on directly.
 fn outputs() -> Result<Vec<Outlet>, Box<dyn Error>> {
-    let all: Vec<Outlet> = cpal::default_host()
-        .output_devices()?
-        .map(|device| Outlet { name: device_name(&device), id: device_id(&device), device })
-        .collect();
+    let outlets = |host: &cpal::Host| -> Result<Vec<Outlet>, Box<dyn Error>> {
+        Ok(host.output_devices()?.map(|device| Outlet { name: device_name(&device), id: device_id(&device), device }).collect())
+    };
+    let host = cpal::default_host();
+    #[allow(unused_mut)]
+    let mut all = outlets(&host)?;
+    #[cfg(target_os = "linux")]
+    if host.id() != cpal::HostId::Alsa
+        && let Ok(alsa) = cpal::host_from_id(cpal::HostId::Alsa)
+    {
+        all.extend(outlets(&alsa)?.into_iter().filter(|o| alsa_port(&o.id).is_some_and(|port| port.plugin == "hw")));
+    }
     let hw_cards: std::collections::HashSet<String> =
         all.iter().filter_map(|o| alsa_port(&o.id)).filter(|port| port.plugin == "hw").map(|port| port.card).collect();
     let mut seen = std::collections::HashSet::new();
@@ -264,9 +276,16 @@ pub fn list_devices() -> Result<(), Box<dyn Error>> {
     let outputs = outputs()?;
     let width = outputs.iter().map(|o| o.name.chars().count()).max().unwrap_or(0);
     println!("Sound outputs (play on one with: rtp-audio --device NAME_OR_ID):");
-    for Outlet { name, id, .. } in &outputs {
-        let mark = if Some(id) == default.as_ref() { "*" } else { " " };
-        println!(" {mark} {name:width$}   {id}");
+    let direct = |o: &Outlet| alsa_port(&o.id).is_some_and(|port| port.plugin == "hw");
+    let server = outputs.iter().any(|o| !direct(o)) && outputs.iter().any(|o| o.id.starts_with("pulseaudio:"));
+    let mut heading_shown = false;
+    for outlet in &outputs {
+        if server && direct(outlet) && !heading_shown {
+            println!("\n Sound cards opened directly (while the sound server isn't using them):");
+            heading_shown = true;
+        }
+        let mark = if Some(&outlet.id) == default.as_ref() { "*" } else { " " };
+        println!(" {mark} {:width$}   {}", outlet.name, outlet.id);
     }
     println!("\n* = the default output");
     Ok(())
@@ -294,10 +313,23 @@ fn pick_device(wanted: Option<&str>) -> Result<cpal::Device, Box<dyn Error>> {
             .into());
         }
     }
-    let matches: Vec<usize> = (0..outputs.len()).filter(|&i| outputs[i].name.to_lowercase().contains(&lower)).collect();
+    let mut matches: Vec<usize> = (0..outputs.len()).filter(|&i| outputs[i].name.to_lowercase().contains(&lower)).collect();
+    // Matching both a sound server output and a card opened directly: the server's (shared with
+    // other programs) is the one meant; the direct one is reached by its ID.
+    let through_server: Vec<usize> = matches.iter().copied().filter(|&i| alsa_port(&outputs[i].id).is_none_or(|port| port.plugin != "hw")).collect();
+    if !through_server.is_empty() && through_server.len() < matches.len() {
+        matches = through_server;
+    }
     match matches.as_slice() {
         [i] => Ok(outputs.swap_remove(*i).device),
         [] => Err(format!("no sound output matches '{wanted}'; see `rtp-audio devices`").into()),
+        // Every match has the same name: only the IDs tell them apart.
+        _ if matches.iter().all(|&i| outputs[i].name == outputs[matches[0]].name) => Err(format!(
+            "'{wanted}' matches several outputs called {}: choose one by its ID ({})",
+            outputs[matches[0]].name,
+            matches.iter().map(|&i| outputs[i].id.as_str()).collect::<Vec<_>>().join(", ")
+        )
+        .into()),
         _ => Err(format!(
             "'{wanted}' matches several outputs ({}); use more of the name, or its ID",
             matches.iter().map(|&i| outputs[i].name.as_str()).collect::<Vec<_>>().join(", ")
@@ -390,9 +422,34 @@ fn split_delay(part: &str) -> Result<(&str, u32), String> {
 /// PulseAudio, the default) keep their own sizes: a short period runs them dry.
 const CARD_PERIOD_MS: u32 = 20;
 
+/// The sample formats sound is played in, best first.
+const FORMATS: [SampleFormat; 5] = [SampleFormat::F32, SampleFormat::I32, SampleFormat::I16, SampleFormat::F64, SampleFormat::U16];
+
+/// The device's own preferred configuration when its format is one we play, else the same rate
+/// and channels in the best format it offers (a sound server may prefer 24-bit, which it would
+/// convert from any other anyway).
+fn playable_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, Box<dyn Error>> {
+    let preferred = device.default_output_config()?;
+    if FORMATS.contains(&preferred.sample_format()) {
+        return Ok(preferred);
+    }
+    let rate = preferred.sample_rate();
+    let ranges: Vec<_> = device.supported_output_configs()?.collect();
+    FORMATS
+        .iter()
+        .find_map(|&format| {
+            ranges
+                .iter()
+                .filter(|range| range.sample_format() == format && range.min_sample_rate() <= rate && rate <= range.max_sample_rate())
+                .max_by_key(|range| range.channels() == preferred.channels())
+                .map(|range| range.with_sample_rate(rate))
+        })
+        .ok_or_else(|| format!("its sample format {} is not supported", preferred.sample_format()).into())
+}
+
 /// Start playing on `device`; returns the stream and a description of it.
 fn open_output(device: &cpal::Device, out: Output) -> Result<(cpal::Stream, String), Box<dyn Error>> {
-    let supported = device.default_output_config()?;
+    let supported = playable_config(device)?;
     let format = supported.sample_format();
     let id = device_id(device);
     // A card opened directly, or an output of the sound server through its own protocol (which
