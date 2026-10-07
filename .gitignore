@@ -6,8 +6,6 @@
 *.zip
 *.sha256
 /rtp-audio-*/
-# Leftovers of the GUI before it moved to src/gui (build cache, screenshots).
-/GUI/
 
 # Maintainer-only notes, kept offline.
 /docs/releasing.md
