@@ -3,8 +3,13 @@ name = "rtp-audio-gui"
 version = "0.4.0"
 edition = "2024"
 
-# The window of `rtp-audio --gui`: a program of its own, so rtp-audio itself needs no WebKit.
-# rtp-audio carries it (built with --features embed-gui) and starts it only for --gui.
+# The window of `rtp-audio --gui`. On Windows and macOS rtp-audio links the library (their web views
+# come with the system); on Linux the program is separate, so rtp-audio itself needs no WebKit:
+# rtp-audio carries it (--features gui) and starts it only for --gui.
+[lib]
+name = "rtp_audio_gui"
+path = "window.rs"
+
 [[bin]]
 name = "rtp-audio-gui"
 path = "main.rs"

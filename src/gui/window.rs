@@ -31,9 +31,13 @@ struct Exit {
     code: Option<i32>,
 }
 
-/// The rtp-audio to run: the one that opened this window ($RTP_AUDIO_BIN), else the one next to
-/// this program; never another one found in PATH, which could be another version.
+/// The rtp-audio to run: the one this window is part of, else the one that started it
+/// ($RTP_AUDIO_BIN), else the one next to this program; never another one found in PATH, which
+/// could be another version.
 fn binary() -> PathBuf {
+    if let Some(path) = CLI.get() {
+        return path.clone();
+    }
     if let Some(path) = std::env::var_os("RTP_AUDIO_BIN") {
         return path.into();
     }
@@ -221,8 +225,15 @@ fn interrupt(running: &Running) -> Option<u64> {
     Some(*run)
 }
 
-/// Opens the window.
-pub fn run() {
+/// The rtp-audio this window is part of (Windows, macOS), given to `run`.
+static CLI: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Opens the window; `cli` is the rtp-audio it runs for its commands, when the window is part of
+/// it. Returns when the window closes.
+pub fn run(cli: Option<PathBuf>) {
+    if let Some(path) = cli {
+        CLI.set(path).ok();
+    }
     let app = tauri::Builder::default()
         .manage(Running::default())
         .invoke_handler(tauri::generate_handler![backend_version, list_outputs, list_sources, start, stop])

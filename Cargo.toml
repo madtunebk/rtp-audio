@@ -15,10 +15,11 @@ socket2 = "0.6"
 tungstenite = "0.30"
 
 [features]
-# Carry the window program (src/gui, built first) inside rtp-audio, for `rtp-audio --gui`:
-# RTP_AUDIO_GUI_BIN=src/gui/target/release/rtp-audio-gui cargo build --release --features embed-gui
-# rtp-audio itself never links the window's libraries (WebKit): only that program does.
-embed-gui = []
+# The window, `rtp-audio --gui` (build its page first: src/gui/README.md). Windows and macOS link it
+# in. On Linux rtp-audio carries it as a separate program, built first, so rtp-audio itself never
+# links WebKit:
+# RTP_AUDIO_GUI_BIN=src/gui/target/release/rtp-audio-gui cargo build --release --features gui
+gui = ["dep:rtp-audio-gui"]
 
 [profile.release]
 strip = true
@@ -31,5 +32,8 @@ libc = "0.2"
 libpulse-binding = "2.30"
 signal-hook = "0.4"
 
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rtp-audio-gui = { path = "src/gui", optional = true }
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }

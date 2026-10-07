@@ -13,8 +13,8 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-The window (`rtp-audio --gui`) is a separate program carried inside rtp-audio; building it needs
-Node and WebKitGTK's development files: see [src/gui/README.md](../src/gui/README.md). Without it,
+The window (`rtp-audio --gui`, `--features gui`) needs Node to build its page, and on Linux
+WebKitGTK's development files: see [src/gui/README.md](../src/gui/README.md). Without it,
 `rtp-audio --gui` says so and everything else works.
 
 ## Runtime requirements and limitations

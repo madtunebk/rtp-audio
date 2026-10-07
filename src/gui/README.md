@@ -1,10 +1,15 @@
 # The window: `rtp-audio --gui`
 
-A Tauri window with a Svelte page, built as a program of its own, `rtp-audio-gui`. rtp-audio never
-links its libraries (WebKitGTK on Linux): it carries the window program (when built with
-`--features embed-gui`), writes it once to `~/.cache/rtp-audio/gui-VERSION-HASH/`, checks that it
-can load (with a clear message naming the package to install when WebKitGTK is missing) and starts
-it with `RTP_AUDIO_BIN` set to its own path. So:
+A Tauri window with a Svelte page, built into rtp-audio with `--features gui`:
+
+- **Windows, macOS:** the window is part of `rtp-audio(.exe)`; their web views (WebView2,
+  WKWebView) come with the system.
+- **Linux:** the window is a program of its own, `rtp-audio-gui`, so that rtp-audio itself never
+  links WebKitGTK. rtp-audio carries it, writes it once to `~/.cache/rtp-audio/gui-VERSION-HASH/`,
+  checks that it can load (with a clear message naming the package to install when WebKitGTK is
+  missing) and starts it with `RTP_AUDIO_BIN` set to its own path.
+
+So:
 
 - `rtp-audio find`, `devices`, `send`… run on a server without WebKit;
 - the window runs the very rtp-audio that opened it, never another one found in PATH;
@@ -25,16 +30,29 @@ On Ubuntu, building the window needs (see https://v2.tauri.app/start/prerequisit
 sudo apt install libwebkit2gtk-4.1-dev libxdo-dev libssl-dev librsvg2-dev
 ```
 
-Build the page (Node 20 or newer), then the window, then rtp-audio carrying it:
+Build the page first (Node 20 or newer):
 
 ```bash
 (cd src/gui/web && npm ci && npm run build)
+```
+
+Windows, macOS:
+
+```bash
+cargo build --release --features gui
+```
+
+Linux: the window program first, then rtp-audio carrying it:
+
+```bash
 cargo build --release --manifest-path src/gui/Cargo.toml
-RTP_AUDIO_GUI_BIN=$PWD/src/gui/target/release/rtp-audio-gui cargo build --release --features embed-gui
+RTP_AUDIO_GUI_BIN=$PWD/src/gui/target/release/rtp-audio-gui cargo build --release --features gui
 ./target/release/rtp-audio --gui
 ```
 
-Without `embed-gui`, rtp-audio looks for `rtp-audio-gui` next to itself instead.
+Without `gui`, rtp-audio looks for `rtp-audio-gui` next to itself instead. Cross-built from Linux
+for Windows (`x86_64-pc-windows-gnu`), the exe also needs `WebView2Loader.dll` beside it; the MSVC
+build (the release) links it in.
 
 ## The page
 
