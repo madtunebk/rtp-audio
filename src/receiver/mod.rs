@@ -42,6 +42,8 @@ pub struct Options {
     pub url: Option<String>,
     /// The status as JSON lines, for a program running the receiver.
     pub json: bool,
+    /// Line the outputs up by the latency each reports.
+    pub sync: bool,
 }
 
 /// The jitter buffers of all the outputs: every frame goes into each (and into the spectrum, with
@@ -146,7 +148,10 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
         }
     }
     let mut jitter = Buffers(buffers, options.json.then(|| spectrum::Tap::new(options.rate)));
-    let mut monitor = Monitor::new(options.rate, options.json.then_some(ids));
+    if options.sync && cards.len() > 1 {
+        println!("Lining the outputs up by the latency each reports (--sync); a Bluetooth speaker's own delay isn't reported: add it with +NNms");
+    }
+    let mut monitor = Monitor::new(options.rate, options.json.then_some(ids), options.sync);
     match &options.url {
         Some(url) => receive_websocket(url, &options, &card, &mut jitter, &peak, &mut monitor),
         None => receive_udp(&options, &card, &mut jitter, &peak, &mut monitor),

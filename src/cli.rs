@@ -9,13 +9,15 @@ use crate::net::transport::{Encoding, OPUS_KBPS_RANGE};
 pub const USAGE: &str = "\
 usage:
   rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME[,NAME...]] [--volume 100]
-                     [--group 239.255.46.1] [--no-discovery] [--json]
+                     [--group 239.255.46.1] [--no-discovery] [--sync] [--json]
       play RTP audio (16-bit PCM) arriving on a UDP port; --latency is the buffer in ms,
       --device an output from `rtp-audio devices` (several, separated by commas, play the same
       sound at once: --device 'HDMI, Headphones'; each can end with a delay and a volume of its
       own: 'HDMI+80ms, Bose@50%'), --volume in percent, --group also listens to a multicast
-      group, --json prints the status as a JSON line every half second (for programs)
-  rtp-audio [receive] ws://HOST:PORT [--latency 60] [--device NAME[,NAME...]] [--volume 100] [--json]
+      group, --sync lines several outputs up by the latency each reports (not a Bluetooth
+      speaker's own delay: add that with +NNms), --json prints the status as a JSON line every
+      half second (for programs)
+  rtp-audio [receive] ws://HOST:PORT [--latency 60] [--device NAME[,NAME...]] [--volume 100] [--sync] [--json]
       play the stream of `rtp-audio send --web` over TCP instead: nothing is lost, and it goes
       through an SSH tunnel (ssh -L 46080:localhost:46080 SERVER, then ws://localhost:46080)
   rtp-audio devices [--json]
@@ -103,7 +105,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
     let (mut source, mut stdin, mut web) = (None, false, None);
     let (mut devices, mut volume): (Vec<String>, _) = (Vec::new(), None);
     let (mut opus, mut key, mut key_file, mut mic, mut kbps) = (false, None, None, false, None);
-    let (mut group, mut discovery, mut json) = (None, true, false);
+    let (mut group, mut discovery, mut json, mut sync) = (None, true, false, false);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
@@ -128,6 +130,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             "--group" => group = Some(value()?),
             "--no-discovery" => discovery = false,
             "--json" => json = true,
+            "--sync" => sync = true,
             "--key" => key = Some(value()?),
             "--key-file" => key_file = Some(value()?),
             "--volume" => volume = Some(number::<f32>(&arg, &value()?)?),
@@ -158,6 +161,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             ("--group", group.is_some()),
             ("--no-discovery", !discovery),
             ("--json", json),
+            ("--sync", sync),
         ];
         match given.iter().find(|(name, set)| *set && !allowed.contains(name)) {
             Some((name, _)) => Err(format!("{name} can't be used here\n\n{USAGE}")),
@@ -251,7 +255,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }))
         }
         _ => {
-            only(&["--port", "--latency", "--rate", "--channels", "--device", "--volume", "--key", "--key-file", "--group", "--no-discovery", "--json"])?;
+            only(&["--port", "--latency", "--rate", "--channels", "--device", "--volume", "--key", "--key-file", "--group", "--no-discovery", "--json", "--sync"])?;
             let mut url = None;
             for arg in &positional {
                 if url.is_none() && (arg.starts_with("ws://") || arg.starts_with("wss://")) {
@@ -262,7 +266,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             }
             if url.is_some() {
                 // The stream is Opus at 48 kHz, protected by the tunnel (or proxy) it goes through.
-                only(&["--latency", "--channels", "--device", "--volume", "--json"])?;
+                only(&["--latency", "--channels", "--device", "--volume", "--json", "--sync"])?;
             }
             let group = match group {
                 None => None,
@@ -287,6 +291,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
                 discovery,
                 url,
                 json,
+                sync,
             }))
         }
     }

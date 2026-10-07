@@ -24,7 +24,7 @@
   let sources = [];
   let mode = 'receive', transport = 'udp', recvPort = 46000, wsAddress = 'localhost:46080';
   let delivery = 'udp', destination = '', webPort = 46080, opus = true, mic = false, source = '', kbps = 128;
-  let latency = 60, volume = 100;
+  let latency = 60, volume = 100, sync = false;
   let running = false, starting = false, elapsed = 0, tick = 0, presets = [], presetName = '', presetOpen = false;
   let logOpen = false, notice = '', copied = false, loaded = false, saved = null;
   let settingsOpen = false, presetPage = 0, run = 0, status = null, backend = '', liveBands = null;
@@ -39,7 +39,7 @@
   let logs = [real ? 'Studio ready.' : 'Studio ready. Example devices loaded.'];
   const bars = Array.from({ length: 34 }, (_, i) => i);
   $: enabled = outputs.filter(o => o.enabled).length;
-  $: settings = { mode, transport, recvPort, wsAddress, delivery, destination, webPort, opus, mic, source, kbps, latency, volume };
+  $: settings = { mode, transport, recvPort, wsAddress, delivery, destination, webPort, opus, mic, source, kbps, latency, volume, sync };
   // Opus's bit rate matters when something is sent as Opus: the UDP stream with Opus, or browsers.
   $: usesOpus = (delivery !== 'web' && opus) || delivery !== 'udp';
   $: args = makeArgs(settings, outputs);
@@ -79,6 +79,7 @@
     if (typeof data.source === 'string') source = data.source;
     latency = clamp(data.latency, LIMITS.latency, latency);
     volume = clamp(data.volume, LIMITS.volume, volume);
+    sync = !!data.sync;
     if (Array.isArray(data.outputs)) outputs = outputs.map(o => {
       const kept = data.outputs.find(s => s && s.id === o.id);
       return kept ? { ...o, enabled: !!kept.enabled, gain: clamp(kept.gain, LIMITS.gain, o.gain), delay: clamp(kept.delay, LIMITS.delay, o.delay) } : { ...o, enabled: false };
@@ -173,6 +174,7 @@
     if (on.length) a.push('--device', on.map(device).join(', '));
     a.push('--latency', String(s.latency));
     if (s.volume !== 100) a.push('--volume', String(s.volume));
+    if (s.sync && on.length > 1) a.push('--sync');
     return a;
   }
   /** For the preview: quoted for a shell only where needed. */
@@ -244,6 +246,7 @@
             {#if transport === 'udp'}<label class="field"><span>Listen port</span><input type="number" min="1" max="65535" bind:value={recvPort} disabled={running}/></label>{:else}<label class="field wide"><span>Server address</span><input bind:value={wsAddress} placeholder="localhost:46080" disabled={running}/></label>{/if}
             <label class="field"><span>Buffer</span><div class="unit-input"><input type="number" min="20" max="2000" bind:value={latency} disabled={running}/><span>ms</span></div></label>
             <label class="field"><span>Master volume</span><div class="unit-input"><input type="number" min="0" max="400" bind:value={volume} disabled={running}/><span>%</span></div></label>
+            <label class="mic-toggle" title="Each output waits for the slowest by the latency it reports. Not a Bluetooth speaker's own delay: give the others a delay for that."><input type="checkbox" bind:checked={sync} disabled={running}/> Line outputs up (--sync)</label>
           {:else}
             <label class="field"><span>Delivery</span><select bind:value={delivery} disabled={running}><option value="udp">UDP to a receiver</option><option value="web">Browsers (noVNC, ws://)</option><option value="both">Both</option></select></label>
             {#if delivery !== 'web'}<label class="field wide"><span>Receiver · HOST:PORT</span><input bind:value={destination} disabled={running} placeholder="192.168.1.20:46000"/></label>{/if}

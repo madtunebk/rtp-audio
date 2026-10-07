@@ -46,9 +46,21 @@ give the earlier ones a delay, in milliseconds, to line them up by ear:
 
 ```bash
 ./rtp-audio --device "HDMI 2+120ms, Bose"
+./rtp-audio --device "HDMI 2+200ms, Bose@70%"            # and a volume of its own
 ```
- Each output keeps its own buffer, since every sound card runs on its own clock; one that
-won't open is skipped, the others still play.
+
+`--sync` does the part the outputs report themselves: each waits for the slowest by the latency
+its card or sound server tells (HDMI, USB, analog differ by a few to tens of ms), and keeps
+following it. A Bluetooth speaker's own delay (often around 200 ms) isn't reported, on Windows or
+Linux, so give the other outputs that by hand on top:
+
+```bash
+./rtp-audio --sync --device "HDMI 2+200ms, ALC897 Analog+200ms, Bose"
+```
+
+Each output keeps its own buffer, since every sound card runs on its own clock; one that won't
+open is skipped, the others still play. Cards opened directly are listed by where they sit
+(`alsa:hw:BUS=0000:01:00.1,DEV=3`), so their IDs stay right after a restart.
 
 ## 2. Find the receiver's IP address
 

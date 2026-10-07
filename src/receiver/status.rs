@@ -11,8 +11,8 @@ struct Snapshot {
     stats: Vec<Stats>,
     buffered: usize,
     labels: Vec<String>,
-    /// Per output: sound buffered here and the device's own latency, in ms.
-    timing: Vec<(f32, f32)>,
+    /// Per output: sound buffered here, the device's own latency, and what --sync adds, in ms.
+    timing: Vec<(f32, f32, f32)>,
     spectrum: Option<[f32; super::spectrum::BANDS]>,
     level: f32,
     packets: u32,
@@ -34,9 +34,11 @@ pub(super) struct Monitor {
     heard: Instant,
     last: Instant,
     rate: u32,
+    /// With --sync: each output's device latency, smoothed (ms).
+    sync: Option<Vec<f32>>,
 }
 impl Monitor {
-    pub(super) fn new(rate: u32, json: Option<Vec<String>>) -> Self {
+    pub(super) fn new(rate: u32, json: Option<Vec<String>>, sync: bool) -> Self {
         let mut reporter = Reporter::new(rate, json);
         let live = reporter.live;
         let (publish, receiver) = std::sync::mpsc::sync_channel(2);
@@ -46,7 +48,7 @@ impl Monitor {
             }
         });
         let now = Instant::now();
-        Self { live, publish, sender: None, description: String::new(), packets: 0, bytes: 0, heard: now, last: now, rate }
+        Self { live, publish, sender: None, description: String::new(), packets: 0, bytes: 0, heard: now, last: now, rate, sync: sync.then(Vec::new) }
     }
     /// A packet of `bytes` of sound (its codec payload) arrived from `from`.
     pub(super) fn arrived(&mut self, from: &str, bytes: usize, describe: impl FnOnce() -> String) {
@@ -66,6 +68,9 @@ impl Monitor {
             return;
         }
         self.last = Instant::now();
+        if let Some(smoothed) = &mut self.sync {
+            align(smoothed, jitter, self.rate);
+        }
         let (stats, buffered) = jitter.state();
         let labels = jitter.labels().iter().map(|label| (*label).to_owned()).collect();
         let mut errors = Vec::new();
@@ -85,7 +90,11 @@ impl Monitor {
             timing: jitter
                 .0
                 .iter()
-                .map(|(_, feed)| (feed.metrics.state().1 as f32 * 1000.0 / self.rate as f32, feed.metrics.device_latency_ms()))
+                .map(|(_, feed)| {
+                    let ms = |frames: usize| frames as f32 * 1000.0 / self.rate as f32;
+                    let sync = feed.metrics.sync_frames.load(Ordering::Relaxed);
+                    (ms(feed.metrics.state().1), feed.metrics.device_latency_ms(), ms(sync))
+                })
                 .collect(),
             spectrum: jitter.1.as_ref().and_then(|tap| tap.latest()),
             level: f32::from_bits(peak.swap(0, Ordering::Relaxed)),
@@ -251,7 +260,7 @@ fn json_status(
     labels: &[&str],
     ids: &[String],
     stats: &[Stats],
-    timing: &[(f32, f32)],
+    timing: &[(f32, f32, f32)],
     level: f32,
 ) -> String {
     use crate::json::string;
@@ -263,9 +272,9 @@ fn json_status(
         .zip(ids)
         .zip(stats)
         .zip(timing)
-        .map(|(((name, id), s), (buffer_ms, device_ms))| {
+        .map(|(((name, id), s), (buffer_ms, device_ms, sync_ms))| {
             format!(
-                r#"{{"name":{},"id":{},"buffer_ms":{buffer_ms:.1},"device_ms":{device_ms:.1},"dropouts":{},"skips":{},"card":{}}}"#,
+                r#"{{"name":{},"id":{},"buffer_ms":{buffer_ms:.1},"device_ms":{device_ms:.1},"sync_ms":{sync_ms:.1},"dropouts":{},"skips":{},"card":{}}}"#,
                 string(name),
                 string(id),
                 s.underruns,
@@ -281,6 +290,34 @@ fn json_status(
 }
 
 pub(super) const STATUS_WIDTH: usize = 100;
+
+/// --sync: makes every output wait as long as the slowest one takes to play, by the device latency
+/// each reports (the time from its callback to the sound leaving it). That covers cards, HDMI and
+/// USB; a Bluetooth speaker's own delay isn't reported, and stays for --device's +NNms.
+fn align(smoothed: &mut Vec<f32>, jitter: &Buffers, rate: u32) {
+    let latencies: Vec<f32> = jitter.0.iter().map(|(_, feed)| feed.metrics.device_latency_ms()).collect();
+    smoothed.resize(latencies.len(), 0.0);
+    for (smooth, &latency) in smoothed.iter_mut().zip(&latencies) {
+        // An output that hasn't told its latency yet (not playing, or a sound server still
+        // measuring) keeps what it had. The reports jump by a period from one callback to the
+        // next: follow them slowly.
+        if latency > 0.0 {
+            *smooth = if *smooth == 0.0 { latency } else { *smooth * 0.95 + latency * 0.05 };
+        }
+    }
+    let slowest = smoothed.iter().copied().fold(0.0, f32::max);
+    for ((_, feed), &smooth) in jitter.0.iter().zip(smoothed.iter()) {
+        if smooth == 0.0 {
+            continue;
+        }
+        let frames = ((slowest - smooth) * rate as f32 / 1000.0).round() as usize;
+        let current = feed.metrics.sync_frames.load(Ordering::Relaxed);
+        // Only a change of more than 2 ms moves it: each move is a little speed-up or slow-down.
+        if frames.abs_diff(current) > rate as usize / 500 {
+            feed.metrics.sync_frames.store(frames, Ordering::Relaxed);
+        }
+    }
+}
 
 /// What went wrong on each output since some earlier totals. Network problems (lost, late) are
 /// the same for every output, so they're counted once; playing problems belong to an output.
@@ -387,10 +424,29 @@ pub(super) fn report(problems: Problems) {
 mod tests {
     use super::*;
     #[test]
+    fn sync_makes_the_quicker_outputs_wait_for_the_slowest() {
+        let outputs: Vec<_> = [40_000u64, 80_000, 45_000, 0]
+            .iter()
+            .map(|&latency_us| {
+                let (feed, _, _) = crate::receiver::jitter::channel(2880);
+                feed.metrics.device_latency_us.store(latency_us, Ordering::Relaxed);
+                (String::new(), feed)
+            })
+            .collect();
+        let buffers = Buffers(outputs, None);
+        let mut smoothed = Vec::new();
+        align(&mut smoothed, &buffers, 48_000);
+        let sync: Vec<usize> = buffers.0.iter().map(|(_, feed)| feed.metrics.sync_frames.load(Ordering::Relaxed)).collect();
+        // 40 and 35 ms more for the quicker two, none for the slowest (48 frames per ms), and
+        // nothing yet for one that hasn't told its latency.
+        assert_eq!(sync, [1920, 0, 1680, 0]);
+    }
+
+    #[test]
     fn stalled_telemetry_consumer_cannot_backpressure_reception() {
         let (publish, receiver) = std::sync::mpsc::sync_channel(2);
         let now = Instant::now();
-        let mut monitor = Monitor { live: false, publish, sender: None, description: String::new(), packets: 0, bytes: 0, heard: now, last: now, rate: 48_000 };
+        let mut monitor = Monitor { live: false, publish, sender: None, description: String::new(), packets: 0, bytes: 0, heard: now, last: now, rate: 48_000, sync: None };
         let mut buffers = Buffers(Vec::new(), None);
         let peak = AtomicU32::new(0);
         for i in 0..100 {

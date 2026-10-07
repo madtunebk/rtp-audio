@@ -22,8 +22,10 @@ test('output selection updates command; demo start and stop never run the backen
   await expect(page.locator('.command-panel code')).toContainText('pulseaudio:bluez_output.example+180ms@70%');
   await page.locator('.stream-summary').click();
   await page.getByLabel('Listen port').fill('46001');
+  await page.getByLabel('Line outputs up (--sync)').check();
   await page.getByRole('button',{name:'Done',exact:true}).click();
   await expect(page.locator('.command-panel code')).toContainText('--port 46001');
+  await expect(page.locator('.command-panel code')).toContainText('--sync');
   await page.getByRole('button', { name: 'Start demo' }).click();
   await expect(page.locator('.session-status')).toHaveText('SIMULATED');
   await page.locator('.stream-summary').click();

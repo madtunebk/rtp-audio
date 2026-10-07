@@ -194,6 +194,9 @@ pub(super) struct Metrics {
     /// How long the sound card (or sound server) takes to play what the callback writes, in µs:
     /// cpal's playback minus callback instant.
     pub(super) device_latency_us: std::sync::atomic::AtomicU64,
+    /// With --sync: how much more sound this output keeps buffered (frames) to play together with
+    /// the slowest output.
+    pub(super) sync_frames: std::sync::atomic::AtomicUsize,
 }
 impl Metrics {
     pub(super) fn state(&self) -> (Stats, usize) {
@@ -233,6 +236,8 @@ pub(super) struct Feed {
 pub(super) struct Playback {
     consumer: rtrb::Consumer<Frame>,
     jitter: Jitter,
+    /// The buffer this output aims for, before --sync adds to it.
+    base: usize,
     generation: u64,
     pub(super) metrics: std::sync::Arc<Metrics>,
 }
@@ -243,7 +248,7 @@ pub(super) fn channel(target: usize) -> (Feed, Playback, rtrb::Producer<cpal::Er
     let metrics = std::sync::Arc::new(Metrics::default());
     (
         Feed { producer, metrics: metrics.clone(), errors: read_errors, sequence: None, generation: 0 },
-        Playback { consumer, jitter: Jitter::new(target), generation: 0, metrics },
+        Playback { consumer, jitter: Jitter::new(target), base: target, generation: 0, metrics },
         errors,
     )
 }
@@ -318,7 +323,9 @@ impl Playback {
         // A short --latency must still cover one hardware callback plus interpolation.
         // Keep the preallocated bound even if a backend unexpectedly asks for a huge block.
         let needed = (frames as f64 * player.base_step * (1.0 + MAX_ADJUST)).ceil() as usize + 2;
-        self.jitter.target = self.jitter.target.max(needed.min(self.jitter.max - 1));
+        // --sync's share comes in through the speed adjustment, or at once before playing.
+        let wanted = self.base + self.metrics.sync_frames.load(std::sync::atomic::Ordering::Relaxed);
+        self.jitter.target = wanted.max(needed).min(self.jitter.max - 1);
     }
     pub(super) fn update_speed(&self, player: &mut Player) {
         player.update_speed(&self.jitter);
@@ -471,6 +478,18 @@ mod tests {
         feed.push(0, &packet(-16384, 4), 1);
         output.refill();
         assert_eq!(output.next_frame(&mut player), [-0.5; 2]);
+    }
+
+    #[test]
+    fn sync_adds_to_the_target_and_takes_it_back() {
+        let (_feed, mut output, _errors) = super::channel(2880);
+        let player = Player::new(48000, 48000);
+        output.metrics.sync_frames.store(960, std::sync::atomic::Ordering::Relaxed);
+        output.prepare_callback(&player, 480);
+        assert_eq!(output.jitter.target, 2880 + 960);
+        output.metrics.sync_frames.store(0, std::sync::atomic::Ordering::Relaxed);
+        output.prepare_callback(&player, 480);
+        assert_eq!(output.jitter.target, 2880);
     }
 
     #[test]
