@@ -14,6 +14,10 @@ opus = "0.4"
 socket2 = "0.6"
 tungstenite = "0.30"
 
+[build-dependencies]
+# rtp-audio.exe's icon and manifest (windows/).
+embed-resource = "3"
+
 [features]
 # The window, `rtp-audio --gui` (build its page first: src/gui/README.md). Windows and macOS link it
 # in. On Linux rtp-audio carries it as a separate program, built first, so rtp-audio itself never

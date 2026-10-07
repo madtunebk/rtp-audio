@@ -2992,6 +2992,7 @@ version = "0.4.0"
 dependencies = [
  "chacha20poly1305",
  "cpal",
+ "embed-resource",
  "gethostname",
  "getrandom 0.4.3",
  "if-addrs",

@@ -1,0 +1,3 @@
+// rtp-audio.exe's resources: its icon and its manifest (see rtp-audio.manifest).
+1 ICON "../src/gui/icons/icon.ico"
+1 24 "rtp-audio.manifest"
