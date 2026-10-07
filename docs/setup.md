@@ -51,8 +51,8 @@ give the earlier ones a delay, in milliseconds, to line them up by ear:
 
 `--sync` does the part the outputs report themselves: each waits for the slowest by the latency
 its card or sound server tells (HDMI, USB, analog differ by a few to tens of ms), and keeps
-following it. A Bluetooth speaker's own delay (often around 200 ms) isn't reported, on Windows or
-Linux, so give the other outputs that by hand on top:
+following it. A Bluetooth speaker's own delay (often around 200 ms) may not be reported (Windows
+doesn't), so give the other outputs that by hand on top:
 
 ```bash
 ./rtp-audio --sync --device "HDMI 2+200ms, ALC897 Analog+200ms, Bose"

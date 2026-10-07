@@ -293,7 +293,7 @@ pub(super) const STATUS_WIDTH: usize = 100;
 
 /// --sync: makes every output wait as long as the slowest one takes to play, by the device latency
 /// each reports (the time from its callback to the sound leaving it). That covers cards, HDMI and
-/// USB; a Bluetooth speaker's own delay isn't reported, and stays for --device's +NNms.
+/// USB; a Bluetooth speaker's own delay may not be (Windows doesn't), and stays for +NNms.
 fn align(smoothed: &mut Vec<f32>, jitter: &Buffers, rate: u32) {
     let latencies: Vec<f32> = jitter.0.iter().map(|(_, feed)| feed.metrics.device_latency_ms()).collect();
     smoothed.resize(latencies.len(), 0.0);
