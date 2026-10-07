@@ -2,16 +2,11 @@
 //! and on Linux, send this machine's sound. See `cli::USAGE`.
 
 mod cli;
-mod discover;
-mod jitter;
+mod net;
+mod receiver;
+// The sender (and its web server) captures through PulseAudio/PipeWire: Linux only.
 #[cfg(target_os = "linux")]
-mod linux;
-mod receive;
-mod rtp;
-mod secure;
-mod transport;
-#[cfg(target_os = "linux")]
-mod web;
+mod sender;
 
 use std::error::Error;
 use std::io::IsTerminal;
@@ -39,10 +34,10 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             println!("rtp-audio {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Command::Receive(options) => receive::run(options),
-        Command::Devices => receive::list_devices(),
+        Command::Receive(options) => receiver::run(options),
+        Command::Devices => receiver::list_devices(),
         Command::Keygen => {
-            println!("{}", secure::generate()?);
+            println!("{}", net::secure::generate()?);
             // Only when the key went to the screen: `keygen > file` needs no advice.
             if std::io::stdout().is_terminal() {
                 eprintln!(
@@ -53,23 +48,23 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             }
             Ok(())
         }
-        Command::Find(port) => discover::print_found(port),
+        Command::Find(port) => net::discover::print_found(port),
         Command::Send(mut options) if options.stdin => {
             if let Some(port) = options.auto {
-                options.destinations.push(discover::pick(port)?);
+                options.destinations.push(net::discover::pick(port)?);
             }
-            transport::send_stdin(options.destinations[0], options.rate, options.channels, options.encoding)
+            net::transport::send_stdin(options.destinations[0], options.rate, options.channels, options.encoding)
         }
         #[cfg(target_os = "linux")]
-        Command::Sources => linux::list_sources(),
+        Command::Sources => sender::list_sources(),
         #[cfg(target_os = "linux")]
-        Command::Service { action, send_args } => linux::service::run(&action, &send_args),
+        Command::Service { action, send_args } => sender::service::run(&action, &send_args),
         #[cfg(target_os = "linux")]
         Command::Send(mut options) => {
             if let Some(port) = options.auto {
-                options.destinations.push(discover::pick(port)?);
+                options.destinations.push(net::discover::pick(port)?);
             }
-            linux::sender::run(&options.destinations, options.encoding, options.source.as_deref(), options.web, options.mic)
+            sender::send::run(&options.destinations, options.encoding, options.source.as_deref(), options.web, options.mic)
         }
         #[cfg(not(target_os = "linux"))]
         Command::Sources | Command::Send(_) | Command::Service { .. } => {

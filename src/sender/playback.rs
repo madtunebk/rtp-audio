@@ -11,7 +11,7 @@ use pa::stream::{FlagSet, SeekMode, State, Stream};
 
 use super::Event;
 use super::pulse::Pulse;
-use crate::web::MicFeed;
+use crate::sender::web::MicFeed;
 
 /// What the browser sends: 48 kHz mono.
 const RATE: u32 = 48_000;

@@ -6,8 +6,8 @@ use std::io::{ErrorKind, Read};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
-use crate::rtp;
-use crate::secure::Key;
+use crate::net::rtp;
+use crate::net::secure::Key;
 
 /// L16: 5 ms of audio per packet, small enough for low latency, ~1 KB so it never fragments.
 const PCM_PACKET_MS: u32 = 5;
@@ -216,8 +216,8 @@ const STDIN_LEAD: Duration = Duration::from_millis(100);
 #[cfg(test)]
 mod tests {
     use super::{Encoding, RtpSender};
-    use crate::rtp;
-    use crate::secure::{self, Key};
+    use crate::net::rtp;
+    use crate::net::secure::{self, Key};
     use std::net::UdpSocket;
     use std::time::Duration;
 

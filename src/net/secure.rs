@@ -11,7 +11,7 @@
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
-use crate::rtp;
+use crate::net::rtp;
 
 pub const PAYLOAD_TYPE: u8 = 120;
 const COUNTER_LEN: usize = 8;

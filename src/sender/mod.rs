@@ -1,12 +1,14 @@
-//! Sending this computer's sound on Linux, through PulseAudio or PipeWire (pipewire-pulse).
+//! Sending this computer's sound, through PulseAudio or PipeWire (pipewire-pulse): Linux only.
+//! The receiver, in `receiver`, runs everywhere.
 
 mod capture;
 mod lock;
 mod playback;
 mod pulse;
 mod routing;
-pub mod sender;
+pub mod send;
 pub mod service;
+pub mod web;
 
 use std::error::Error;
 

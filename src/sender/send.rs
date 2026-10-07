@@ -15,8 +15,8 @@ use super::playback::Playback;
 use super::pulse::Pulse;
 use super::routing::{self, DISPLAY_NAME, MIC_NAME, Routing};
 use super::{Event, fail_point, lock};
-use crate::transport::{AudioSink, Encoding, RtpSender};
-use crate::web::{self, MicFeed};
+use crate::net::transport::{AudioSink, Encoding, RtpSender};
+use crate::sender::web::{self, MicFeed};
 
 /// Ctrl+C (or SIGTERM) arrived before streaming started.
 #[derive(Debug)]

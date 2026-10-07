@@ -20,7 +20,7 @@ use std::time::Duration;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Bytes, Message};
 
-use crate::transport::AudioSink;
+use crate::net::transport::AudioSink;
 
 pub const RATE: u32 = 48_000;
 pub const CHANNELS: usize = 2;

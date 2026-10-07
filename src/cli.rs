@@ -2,9 +2,9 @@
 
 use std::net::{SocketAddr, ToSocketAddrs};
 
-use crate::receive;
-use crate::secure::Key;
-use crate::transport::Encoding;
+use crate::receiver;
+use crate::net::secure::Key;
+use crate::net::transport::Encoding;
 
 pub const USAGE: &str = "\
 usage:
@@ -57,7 +57,7 @@ pub enum Command {
     Version,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Service { action: String, send_args: Vec<String> },
-    Receive(receive::Options),
+    Receive(receiver::Options),
     Sources,
     Devices,
     Keygen,
@@ -254,7 +254,7 @@ pub fn parse(args: Vec<String>) -> Result<Command, String> {
             if !(0.0..=400.0).contains(&volume) {
                 return Err("--volume must be between 0 and 400 (percent)".into());
             }
-            Ok(Command::Receive(receive::Options {
+            Ok(Command::Receive(receiver::Options {
                 port: nonzero("--port", port.unwrap_or(46000))?,
                 latency_ms: within("--latency", latency_ms.unwrap_or(60), LATENCIES, "ms")?,
                 rate: within("--rate", rate.unwrap_or(48_000), RATES, "Hz")?,
@@ -403,7 +403,7 @@ mod tests {
         assert!(matches!(parse(args("version")), Ok(Command::Version)));
         assert!(matches!(parse(args("--version")), Ok(Command::Version)));
         assert!(matches!(parse(args("send 10.0.0.2:46000 -V")), Ok(Command::Version)));
-        let key = crate::secure::generate().unwrap();
+        let key = crate::net::secure::generate().unwrap();
         let Ok(Command::Send(send)) = parse(args(&format!("send 10.0.0.2:46000 --opus --key {key}"))) else { panic!() };
         assert!(send.encoding.opus && send.encoding.key.is_some());
         assert!(matches!(parse(args(&format!("--key {key}"))), Ok(Command::Receive(o)) if o.key.is_some()));

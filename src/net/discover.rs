@@ -149,8 +149,8 @@ mod tests {
         assert!(parse_answer(b"something else", from).is_none());
         assert!(is_question(QUESTION) && !is_question(b"RTP-AUDIO? 2"));
         // A receiver must never mistake either for sound: not RTP version 2.
-        assert!(crate::rtp::parse(QUESTION).is_none());
-        assert!(crate::rtp::parse(&answer(1, false)).is_none());
+        assert!(crate::net::rtp::parse(QUESTION).is_none());
+        assert!(crate::net::rtp::parse(&answer(1, false)).is_none());
     }
 
     #[test]

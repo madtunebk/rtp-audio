@@ -10,7 +10,7 @@ use pa::stream::{FlagSet, PeekResult, State, Stream};
 
 use super::Event;
 use super::pulse::Pulse;
-use crate::transport::AudioSink;
+use crate::net::transport::AudioSink;
 
 /// What the receiver expects: 48 kHz stereo, big-endian 16-bit (RTP L16).
 pub const RATE: u32 = 48_000;
