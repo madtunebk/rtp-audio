@@ -17,6 +17,13 @@ use std::process::ExitCode;
 use cli::Command;
 
 fn main() -> ExitCode {
+    // Windows consoles show the legacy code page by default, which garbles UTF-8 (device names,
+    // the level meter): ask for UTF-8. Nothing changes when the output goes to a file or a pipe.
+    #[cfg(windows)]
+    unsafe {
+        const CP_UTF8: u32 = 65001;
+        windows_sys::Win32::System::Console::SetConsoleOutputCP(CP_UTF8);
+    }
     match run(std::env::args().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

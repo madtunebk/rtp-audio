@@ -8,14 +8,14 @@ use crate::net::transport::{Encoding, OPUS_KBPS_RANGE};
 
 pub const USAGE: &str = "\
 usage:
-  rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME[,NAME…]] [--volume 100]
+  rtp-audio [receive] [--port 46000] [--latency 60] [--device NAME[,NAME...]] [--volume 100]
                      [--group 239.255.46.1] [--no-discovery] [--json]
       play RTP audio (16-bit PCM) arriving on a UDP port; --latency is the buffer in ms,
       --device an output from `rtp-audio devices` (several, separated by commas, play the same
       sound at once: --device 'HDMI, Headphones'; each can end with a delay and a volume of its
       own: 'HDMI+80ms, Bose@50%'), --volume in percent, --group also listens to a multicast
       group, --json prints the status as a JSON line every half second (for programs)
-  rtp-audio [receive] ws://HOST:PORT [--latency 60] [--device NAME[,NAME…]] [--volume 100] [--json]
+  rtp-audio [receive] ws://HOST:PORT [--latency 60] [--device NAME[,NAME...]] [--volume 100] [--json]
       play the stream of `rtp-audio send --web` over TCP instead: nothing is lost, and it goes
       through an SSH tunnel (ssh -L 46080:localhost:46080 SERVER, then ws://localhost:46080)
   rtp-audio devices [--json]
@@ -28,7 +28,7 @@ usage:
       rtp-audio --key-file rtp-audio.key
   rtp-audio sources [--json]
       list this computer's sound sources (Linux)
-  rtp-audio send HOST:PORT [HOST:PORT…]
+  rtp-audio send HOST:PORT [HOST:PORT...]
       send all of this computer's sound (Linux): adds an \"RTP Audio\" output, makes it the
       default and moves playing apps to it; Ctrl+C switches everything back. HOST:PORT can be
       several receivers, a multicast group (e.g. 239.255.46.1:46000), or `auto`: the one
@@ -37,7 +37,7 @@ usage:
       send one source from `rtp-audio sources` instead, without changing any output
   rtp-audio send HOST:PORT [--opus [--bitrate 128]] [--key KEY | --key-file FILE]
       --opus: about 128 kbit/s instead of 1.5 Mbit/s (needs an rtp-audio receiver), --bitrate
-      sets it (16–510 kbit/s, also for --web: 64 for a slow link, 256 near lossless);
+      sets it (16-510 kbit/s, also for --web: 64 for a slow link, 256 near lossless);
       --key/--key-file: encrypt (the receiver needs the same key)
   rtp-audio send --web 127.0.0.1:46080 [--mic] [HOST:PORT] [--source NAME_OR_ID]
       (also) serve the sound to web browsers as Opus over a WebSocket, with a noVNC player;

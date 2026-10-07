@@ -308,11 +308,11 @@ impl Problems<'_> {
 /// with several), and a level meter.
 pub(super) fn status_line(sender: Option<&str>, waiting: bool, rate: f32, buffer_ms: usize, problems: Problems, level: f32) -> String {
     let line = match sender {
-        None => "Waiting for sound…".to_string(),
+        None => "Waiting for sound...".to_string(),
         Some(_) if waiting => {
             let lost = problems.now.iter().map(|s| s.lost).max().unwrap_or(0);
             let dropouts = problems.now.iter().map(|s| s.underruns).max().unwrap_or(0);
-            format!("Waiting for sound… (problems so far: {lost} lost, {dropouts} dropouts)")
+            format!("Waiting for sound... (problems so far: {lost} lost, {dropouts} dropouts)")
         }
         Some(from) => {
             let db = 20.0 * level.max(1e-6).log10();
