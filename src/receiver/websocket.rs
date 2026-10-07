@@ -79,11 +79,13 @@ pub(super) fn websocket_session(target: &WsTarget, options: &Options, jitter: &B
     socket.get_mut().set_read_timeout(Some(STATUS_EVERY))?;
 
     let mut pcm = vec![0i16; 5760 * channels];
+    let mut frame = Vec::with_capacity(pcm.len() * 2);
     loop {
         match socket.read() {
             Ok(Message::Binary(data)) => {
                 let samples = decoder.decode(&data, &mut pcm, false)?;
-                let frame: Vec<u8> = pcm[..samples * channels].iter().flat_map(|s| s.to_be_bytes()).collect();
+                frame.clear();
+                frame.extend(pcm[..samples * channels].iter().flat_map(|s| s.to_be_bytes()));
                 jitter.push(*sequence, &frame, channels);
                 *sequence = sequence.wrapping_add(1);
                 monitor.arrived(&peer, || "Opus over TCP".to_string());

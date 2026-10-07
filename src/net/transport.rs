@@ -51,6 +51,8 @@ pub struct RtpSender {
     pending: Vec<u8>,
     packet_bytes: usize,
     opus_out: Vec<u8>,
+    /// The packet's samples for the Opus encoder, kept between packets.
+    samples: Vec<i16>,
 }
 
 impl RtpSender {
@@ -103,6 +105,7 @@ impl RtpSender {
             pending: Vec::new(),
             packet_bytes: frames_per_packet as usize * channels * 2,
             opus_out: vec![0; 4000],
+            samples: Vec::new(),
         })
     }
 
@@ -144,9 +147,10 @@ impl RtpSender {
         let (payload_type, payload): (u8, &[u8]) = match &mut self.encoder {
             None => (rtp::L16, &self.pending),
             Some(encoder) => {
-                let samples: Vec<i16> = self.pending.chunks_exact(2).map(|b| i16::from_be_bytes([b[0], b[1]])).collect();
+                self.samples.clear();
+                self.samples.extend(self.pending.chunks_exact(2).map(|b| i16::from_be_bytes([b[0], b[1]])));
                 let len = encoder
-                    .encode(&samples, &mut self.opus_out)
+                    .encode(&self.samples, &mut self.opus_out)
                     .map_err(|err| std::io::Error::other(format!("Opus encoding failed: {err}")))?;
                 (rtp::OPUS, &self.opus_out[..len])
             }

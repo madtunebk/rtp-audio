@@ -30,6 +30,8 @@ pub(super) struct Unpacker {
     pub concealed: u16,
     /// Samples per channel in the last Opus packet: concealment fills exactly that much.
     opus_frame: usize,
+    /// Where Opus decodes to, kept between packets (the largest Opus packet: 120 ms at 48 kHz).
+    pcm: Vec<i16>,
     warned: Option<String>,
 }
 
@@ -46,7 +48,8 @@ pub(super) fn is_l16(payload_type: u8) -> bool {
 impl Unpacker {
     fn new(key: Option<Key>, channels: usize, rate: u32) -> Self {
         let opus_frame = rate as usize / 50;
-        Unpacker { key, replay: ReplayWindow::default(), decoder: None, channels, rate, last_opus: None, concealed: 0, opus_frame, warned: None }
+        let pcm = vec![0; 5760 * channels];
+        Unpacker { key, replay: ReplayWindow::default(), decoder: None, channels, rate, last_opus: None, concealed: 0, opus_frame, pcm, warned: None }
     }
 
     /// A new sender is being played: forget the decoder state of the last one.
@@ -132,11 +135,12 @@ impl Unpacker {
         };
         let mut frames = Vec::new();
         let opus_frame = &mut self.opus_frame;
+        let pcm = &mut self.pcm;
         let mut decode = |decoder: &mut opus::Decoder, sequence: u16, data: &[u8]| -> bool {
             // Without data (a lost packet), Opus conceals as much as the buffer holds.
             let samples = if data.is_empty() { *opus_frame } else { 5760 };
-            let mut pcm = vec![0i16; samples * channels];
-            match decoder.decode(data, &mut pcm, false) {
+            let pcm = &mut pcm[..samples * channels];
+            match decoder.decode(data, pcm, false) {
                 Ok(n) => {
                     if !data.is_empty() {
                         *opus_frame = n;
