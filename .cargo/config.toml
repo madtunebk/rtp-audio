@@ -1,2 +1,7 @@
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
+
+# Windows (MSVC, the release): the C runtime linked in, so rtp-audio.exe runs without the Visual
+# C++ Redistributable (VCRUNTIME140.dll); C code built by cc (Opus) follows with /MT.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

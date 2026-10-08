@@ -29,7 +29,8 @@ cargo build --release --target x86_64-pc-windows-gnu
 ```
 
 Built this way (mingw), the exe needs `WebView2Loader.dll` beside it for the window; the release
-(MSVC) links it in.
+(MSVC) links it in, and links the C runtime statically (`.cargo/config.toml`), so it needs no
+Visual C++ Redistributable.
 
 ## Runtime requirements and limitations
 
